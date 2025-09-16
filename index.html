@@ -1,0 +1,141 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Simulateur de rente - Spirit Asset Management</title>
+  <style>
+    :root {
+      --bg:#f5f7fa; --card:#fff; --text:#0f172a; --muted:#475569; --primary:#1d5fd3; --primary-h:#184fb0;
+      --border:#cbd5e1;
+    }
+    *{box-sizing:border-box}
+    body{
+      margin:0; font-family:Arial,system-ui,-apple-system,Segoe UI,Roboto; color:var(--text);
+      background:var(--bg); display:flex; flex-direction:column; align-items:center; padding:24px;
+    }
+    .logo{margin:0 0 16px}
+    .logo img{max-height:100px}
+    .card{
+      width:560px; max-width:95vw; background:var(--card); border-radius:12px; box-shadow:0 6px 18px rgba(0,0,0,.08);
+      padding:24px;
+    }
+    h2{margin:0 0 16px; text-align:center}
+    label{display:block; margin:14px 0 6px; font-weight:600}
+    .field{width:100%; height:44px; border:1px solid var(--border); border-radius:8px; padding:10px 12px; font-size:16px}
+    /* Alignements : texte à gauche par défaut, seulement le montant est aligné à droite */
+    .field--right{text-align:right}
+    .btn{
+      display:block; width:100%; height:46px; margin-top:18px; border:none; border-radius:8px; cursor:pointer;
+      background:var(--primary); color:#fff; font-size:16px; font-weight:600;
+    }
+    .btn:hover{background:var(--primary-h)}
+    .result{margin-top:18px; padding:14px; border-radius:10px; background:#f1f5f9; font-size:15px}
+    .muted{color:var(--muted)}
+    .error{color:#b91c1c; font-weight:600}
+    .grid{display:grid; grid-template-columns:1fr auto; gap:6px 14px; margin-top:8px}
+    .legal{
+      max-width:760px; margin:22px auto 0; font-size:12px; color:#555; text-align:center;
+    }
+  </style>
+</head>
+<body>
+  <!-- Logo -->
+  <div class="logo"><img src="Schritzug.png" alt="Spirit Asset Management"></div>
+
+  <!-- Carte -->
+  <div class="card">
+    <h2>Simulateur de rente</h2>
+
+    <label for="montant">Montant disponible</label>
+    <input id="montant" class="field field--right" type="text" value="10 000 000" inputmode="numeric" />
+
+    <label for="devise">Devise</label>
+    <select id="devise" class="field">
+      <option value="EUR" selected>EUR</option>
+      <option value="USD">USD</option>
+    </select>
+
+    <label for="duree">Durée (années)</label>
+    <select id="duree" class="field">
+      <option>5</option><option>6</option><option>7</option><option>8</option>
+      <option>9</option><option>10</option><option>11</option><option>12</option>
+    </select>
+
+    <label for="retro">Inclure rétrocessions</label>
+    <select id="retro" class="field">
+      <option value="oui">Oui</option>
+      <option value="non">Non</option>
+    </select>
+
+    <button class="btn" id="go">Calculer</button>
+
+    <div id="result" class="result muted">Renseignez les champs puis cliquez sur “Calculer”.</div>
+  </div>
+
+  <div class="legal">
+    Ces résultats sont donnés à titre purement indicatif et peuvent varier selon les conditions de marché.
+  </div>
+
+<script>
+const API_URL = "https://simulateur-pricer.onrender.com/compute";
+
+const montantEl = document.getElementById("montant");
+montantEl.addEventListener("input", () => {
+  const raw = montantEl.value.replace(/[^\d]/g,"");
+  montantEl.value = raw ? Number(raw).toLocaleString("fr-FR") : "";
+});
+
+document.getElementById("go").addEventListener("click", calculer);
+
+async function calculer(){
+  const result = document.getElementById("result");
+  result.classList.remove("error"); result.classList.add("muted");
+  result.textContent = "Calcul en cours…";
+
+  // Préparer le payload
+  const montant = Number(montantEl.value.replace(/\s/g,"")) || 0;
+  const devise  = document.getElementById("devise").value;
+  const duree   = Number(document.getElementById("duree").value);
+  const retro   = document.getElementById("retro").value; // "oui" | "non"
+
+  try{
+    const res = await fetch(API_URL, {
+      method:"POST",
+      headers: {"Content-Type":"application/json"},
+      body: JSON.stringify({
+        montant_disponible: montant,
+        devise: devise,
+        duree: duree,
+        retrocessions: retro
+      })
+    });
+
+    const data = await res.json().catch(()=> ({}));
+    if(!res.ok) throw new Error(data?.detail || ("HTTP "+res.status));
+
+    const sym = (devise==="USD") ? "$" : "€";
+    // Compatibilité : champs détaillés peuvent s'appeler retro_rate/gestion_rate/garde_rate
+    const retroRate   = (data.retro_rate ?? data.frais_retro ?? 0) * 100;
+    const gestionRate = (data.gestion_rate ?? data.frais_gestion ?? 0) * 100;
+    const gardeRate   = (data.garde_rate ?? data.frais_garde ?? 0) * 100;
+    const tot         = (data.total_frais ?? data.frais_totaux ?? 0) * 100;
+
+    result.classList.remove("muted");
+    result.innerHTML = `
+      <strong>Rente annuelle : ${Number(data.rente_annuelle_arrondie).toLocaleString("fr-FR")} ${sym}/an</strong>
+      <div class="grid">
+        <div>Frais totaux :</div><div>${tot.toFixed(2)} %</div>
+        <div>• Rétrocessions :</div><div>${retroRate.toFixed(2)} %</div>
+        <div>• Frais de gestion :</div><div>${gestionRate.toFixed(2)} %</div>
+        <div>• Droit de garde :</div><div>${gardeRate.toFixed(2)} %</div>
+      </div>
+    `;
+  }catch(err){
+    result.classList.add("error");
+    result.textContent = "Erreur de connexion à l’API : " + (err.message || err);
+  }
+}
+</script>
+</body>
+</html>
