@@ -1,7 +1,7 @@
 # pricer_engine.py
 from typing import Dict
 
-# Courbes de taux actualisées
+# Courbes de taux (inchangées)
 _TENORS = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
 _CURVE: Dict[str, Dict[int, float]] = {
     "EUR": {
@@ -16,7 +16,6 @@ _CURVE: Dict[str, Dict[int, float]] = {
     },
 }
 
-
 def compute_annuity(
     amount: float,
     currency: str,
@@ -24,19 +23,15 @@ def compute_annuity(
     include_retro: bool,
     extra_contract_fee: float = 0.0,
 ) -> Dict[str, float]:
-    """Renvoie la rente annuelle nette et les frais associés."""
-
-    # --- Vérifications basiques ---
+    """Calcule la rente annuelle nette et les frais, en conservant la logique précédente."""
     if currency not in _CURVE:
         raise ValueError(f"Devise non supportée : {currency}")
     if years not in _CURVE[currency]:
         raise ValueError(f"Durée non disponible : {years} ans")
 
-    # --- Récupération du taux ---
-    rate = _CURVE[currency][years] / 100  # en décimal
+    rate = _CURVE[currency][years] / 100.0  # en décimal
 
-    # --- Calcul des frais selon le barème ---
-    # 1. Frais de rétrocession
+    # Barème rétrocessions
     if amount < 10_000_000:
         retro_rate = 0.0021
     elif amount < 15_000_000:
@@ -44,7 +39,7 @@ def compute_annuity(
     else:
         retro_rate = 0.0015
 
-    # 2. Frais de gestion (dépendent du rétro)
+    # Barème frais de gestion (dépend du rétro)
     if include_retro:
         if amount < 10_000_000:
             gestion_rate = 0.0049
@@ -61,17 +56,16 @@ def compute_annuity(
             gestion_rate = 0.0040
         retro_rate = 0.0  # pas de rétro
 
-    # 3. Droit de garde (fixe)
-    garde_rate = 0.0005  # 0.05 %
+    # ✅ Droits de garde = 0,10%
+    garde_rate = 0.0010
 
-    # 4. Frais de contrat (si assurance-vie)
+    # Frais de contrat (assurance-vie)
     frais_contrat = extra_contract_fee or 0.0
 
-    # --- Total des frais ---
+    # Total des frais (les rétro sont incluses dans gestion_rate si applicable)
     total_frais = gestion_rate + garde_rate + frais_contrat
-    # Les rétro sont incluses dans gestion_rate quand applicable
 
-    # --- Calcul rente nette annuelle ---
+    # Rente nette (le front affichera sans décimales)
     rente_nette = amount * rate * (1 - total_frais)
     rente_arrondie = round(rente_nette, 2)
 
