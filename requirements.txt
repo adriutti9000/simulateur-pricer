@@ -1,1 +1,3 @@
-STdv9067+!s
+fastapi
+uvicorn[standard]
+pydantic>=2
