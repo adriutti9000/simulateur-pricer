@@ -16,8 +16,10 @@ _CURVE: Dict[str, Dict[int, float]] = {
     },
 }
 
-# Barème rétrocessions (en décimal)
+# --- Barèmes ---
+
 def _retro_rate(amount: float) -> float:
+    """Rétrocessions (décimal)"""
     if amount < 10_000_000:
         return 0.0021  # 0,21 %
     elif amount < 15_000_000:
@@ -25,8 +27,8 @@ def _retro_rate(amount: float) -> float:
     else:
         return 0.0015  # 0,15 %
 
-# Barème frais de gestion quand rétrocessions = Oui  (déjà "tout compris" côté gestion)
-def _gestion_rate_with_retro(amount: float) -> float:
+def _gestion_with_retro_base(amount: float) -> float:
+    """Barème gestion quand rétro = Oui (hors rétro elle-même) : 0,49 / 0,42 / 0,35."""
     if amount < 10_000_000:
         return 0.0049  # 0,49 %
     elif amount < 15_000_000:
@@ -34,14 +36,18 @@ def _gestion_rate_with_retro(amount: float) -> float:
     else:
         return 0.0035  # 0,35 %
 
-# Barème frais de gestion quand rétrocessions = Non
-def _gestion_rate_without_retro(amount: float) -> float:
+def _gestion_without_retro(amount: float) -> float:
+    """Barème gestion quand rétro = Non : 0,60 / 0,50 / 0,40."""
     if amount < 10_000_000:
         return 0.0060  # 0,60 %
     elif amount < 15_000_000:
         return 0.0050  # 0,50 %
     else:
         return 0.0040  # 0,40 %
+
+_GARDE = 0.0010  # 0,10 %
+
+# --- Moteur ---
 
 def compute_annuity(
     amount: float,
@@ -51,44 +57,40 @@ def compute_annuity(
     extra_contract_fee: float = 0.0,  # ex: 0.001 = 0,10 %
 ) -> Dict[str, float]:
     """
-    Retourne :
+    Retourne un dict avec :
       - rente_annuelle_arrondie (entier, sans décimales)
-      - gestion_rate, retro_rate, garde_rate, frais_contrat, total_frais (décimaux)
-    Rente nette utilisée côté front : amount * curve_rate * (1 - total_frais)
+      - gestion_rate (valeur affichée), retro_rate (info), garde_rate, frais_contrat, total_frais
+    Rente nette = montant * taux_courbe * (1 - total_frais)
     """
     if currency not in _CURVE:
         raise ValueError(f"Devise non supportée : {currency}")
     if years not in _CURVE[currency]:
         raise ValueError(f"Durée non disponible : {years} ans")
 
-    # Taux "marché" de la courbe (en décimal)
-    curve_rate = _CURVE[currency][years] / 100.0
+    curve_rate = _CURVE[currency][years] / 100.0  # décimal
 
-    # Frais de gestion & rétro (affichage)
     if include_retro:
-        gestion_rate = _gestion_rate_with_retro(amount)
-        retro_rate = _retro_rate(amount)   # affiché à part, mais DEJA inclus dans gestion_rate
+        # Gestion affichée = barème gestion (avec rétro) + rétro (affichée séparément)
+        gestion_base = _gestion_with_retro_base(amount)  # ex: 0,0035
+        retro_rate = _retro_rate(amount)                 # ex: 0,0015
+        gestion_display = gestion_base + retro_rate      # ex: 0,0035 + 0,0015 = 0,0050 (0,50 %)
     else:
-        gestion_rate = _gestion_rate_without_retro(amount)
+        gestion_display = _gestion_without_retro(amount) # ex: 0,0040 / 0,0050 / 0,0060
         retro_rate = 0.0
 
-    # Droits de garde = 0,10 %
-    garde_rate = 0.0010
-
-    # Frais d’assurance-vie (si support = assurance-vie)
+    garde_rate = _GARDE
     contract_rate = max(0.0, float(extra_contract_fee or 0.0))
 
-    # >>> TOTAL DES FRAIS SANS AUCUNE SOUSTRACTION DE LA RÉTRO <<<
-    total_frais = gestion_rate + garde_rate + contract_rate
+    # TOTAL = gestion (affichée) + garde + contrat
+    total_frais = gestion_display + garde_rate + contract_rate
 
-    # Rente nette annuelle (pas de décimales)
     rente_nette = amount * curve_rate * (1.0 - total_frais)
-    rente_arrondie = int(round(rente_nette))
+    rente_arrondie = int(round(rente_nette))  # sans décimales
 
     return {
         "rente_annuelle_arrondie": rente_arrondie,
-        "gestion_rate": round(gestion_rate, 6),
-        "retro_rate": round(retro_rate, 6),
+        "gestion_rate": round(gestion_display, 6),  # valeur à AFFICHER
+        "retro_rate": round(retro_rate, 6),         # info pour la note
         "garde_rate": round(garde_rate, 6),
         "frais_contrat": round(contract_rate, 6),
         "total_frais": round(total_frais, 6),
