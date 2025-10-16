@@ -2,180 +2,227 @@
 <html lang="fr">
 <head>
   <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Statistiques du simulateur</title>
-  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <style>
     body {
-      font-family: 'Segoe UI', Tahoma, sans-serif;
-      background: #f8f9fa;
+      font-family: "Inter", Arial, sans-serif;
       margin: 0;
-      padding: 0;
+      padding: 30px;
+      background-color: #f6f8fa;
+      color: #222;
     }
-    header {
-      background: #002b45;
-      color: white;
-      padding: 16px 24px;
+
+    h1 {
       text-align: center;
-      font-size: 22px;
+      font-size: 1.8rem;
+      margin-bottom: 15px;
+    }
+
+    .toolbar {
+      text-align: center;
+      margin-bottom: 25px;
+    }
+
+    button, select, a.download-btn {
+      background-color: #004aad;
+      color: white;
+      border: none;
+      border-radius: 8px;
+      padding: 8px 14px;
+      margin: 5px;
+      font-size: 0.95rem;
+      cursor: pointer;
+      text-decoration: none;
+      display: inline-block;
+    }
+
+    button:hover, a.download-btn:hover {
+      background-color: #0060d1;
+    }
+
+    .stats-grid {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: center;
+      gap: 15px;
+      margin-bottom: 30px;
+    }
+
+    .stat-box {
+      background: white;
+      padding: 15px 20px;
+      border-radius: 10px;
+      box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+      min-width: 180px;
+      text-align: center;
+    }
+
+    .stat-box h3 {
+      margin: 0;
+      font-size: 1.1rem;
+      color: #004aad;
+    }
+
+    .stat-box p {
+      margin: 5px 0 0 0;
+      font-size: 1.4rem;
       font-weight: bold;
     }
-    main {
-      max-width: 900px;
-      margin: 30px auto;
-      background: white;
-      border-radius: 12px;
-      padding: 24px;
-      box-shadow: 0 2px 6px rgba(0,0,0,0.1);
-    }
-    h2 {
-      text-align: center;
-      margin-bottom: 10px;
-      font-size: 20px;
-      color: #002b45;
-    }
-    .controls {
-      text-align: center;
-      margin-bottom: 20px;
-    }
-    select {
-      padding: 6px 10px;
-      border-radius: 6px;
-      border: 1px solid #ccc;
-      font-size: 14px;
-    }
-    table {
+
+    canvas {
       width: 100%;
-      border-collapse: collapse;
-      margin-top: 20px;
+      max-width: 900px;
+      height: 300px;
+      margin: 0 auto;
+      display: block;
     }
+
+    table {
+      border-collapse: collapse;
+      width: 100%;
+      margin-top: 25px;
+      background: white;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+    }
+
     th, td {
       border: 1px solid #ddd;
+      padding: 10px;
       text-align: center;
-      padding: 8px;
     }
+
     th {
-      background: #e9ecef;
-      font-weight: 600;
+      background-color: #004aad;
+      color: white;
     }
+
     tr:nth-child(even) {
-      background: #f9f9f9;
+      background-color: #f9f9f9;
     }
-    .summary {
-      display: flex;
-      justify-content: space-around;
-      margin: 25px 0;
+
+    footer {
+      margin-top: 30px;
       text-align: center;
-    }
-    .summary div {
-      background: #f1f3f5;
-      padding: 12px 18px;
-      border-radius: 8px;
-      flex: 1;
-      margin: 0 5px;
-      font-size: 15px;
+      font-size: 0.85rem;
+      color: #555;
     }
   </style>
 </head>
 <body>
-  <header>Statistiques du simulateur de rente</header>
-  <main>
-    <div class="controls">
-      <label for="days">Période : </label>
-      <select id="days">
-        <option value="7">7 jours</option>
-        <option value="30" selected>30 jours</option>
-        <option value="90">90 jours</option>
-      </select>
+  <h1>Statistiques du simulateur</h1>
+
+  <div class="toolbar">
+    <label for="days">Période :</label>
+    <select id="days">
+      <option value="7">7 jours</option>
+      <option value="30" selected>30 jours</option>
+      <option value="90">90 jours</option>
+    </select>
+
+    <button onclick="refreshStats()">Mettre à jour</button>
+    <a class="download-btn" href="/events.csv" download>Télécharger le CSV</a>
+  </div>
+
+  <div class="stats-grid">
+    <div class="stat-box">
+      <h3>Pages vues</h3>
+      <p id="pageviews">–</p>
     </div>
-
-    <h2>Résumé global</h2>
-    <div class="summary">
-      <div><strong id="pageviews">0</strong><br>Pages vues</div>
-      <div><strong id="clicks">0</strong><br>Calculs lancés</div>
-      <div><strong id="success">0</strong><br>Calculs réussis</div>
-      <div><strong id="errors">0</strong><br>Erreurs</div>
+    <div class="stat-box">
+      <h3>Simulations lancées</h3>
+      <p id="clicks">–</p>
     </div>
+    <div class="stat-box">
+      <h3>Calculs réussis</h3>
+      <p id="success">–</p>
+    </div>
+    <div class="stat-box">
+      <h3>Erreurs</h3>
+      <p id="errors">–</p>
+    </div>
+  </div>
 
-    <h2>Évolution</h2>
-    <canvas id="chart" height="100"></canvas>
+  <canvas id="chart"></canvas>
 
-    <h2>Détail journalier</h2>
-    <table>
-      <thead>
-        <tr>
-          <th>Date</th>
-          <th>Pages vues</th>
-          <th>Calculs</th>
-          <th>Succès</th>
-          <th>Erreurs</th>
-        </tr>
-      </thead>
-      <tbody id="table-body"></tbody>
-    </table>
-  </main>
+  <table>
+    <thead>
+      <tr>
+        <th>Date</th>
+        <th>Pages vues</th>
+        <th>Simulations</th>
+        <th>Réussites</th>
+        <th>Erreurs</th>
+      </tr>
+    </thead>
+    <tbody id="table-body"></tbody>
+  </table>
 
+  <footer>
+    Données en temps réel – Spirit Asset Management © 2025
+  </footer>
+
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
   <script>
-    const API = "https://simulateur-pricer.onrender.com/stats?days=";
-    const daysSelect = document.getElementById("days");
-    const chartCtx = document.getElementById("chart").getContext("2d");
-    let chart;
-
-    async function loadStats(days = 30) {
-      const res = await fetch(API + days);
+    async function refreshStats() {
+      const days = document.getElementById("days").value;
+      const res = await fetch(`/stats?days=${days}`);
       const data = await res.json();
 
-      // Remplissage du résumé
-      document.getElementById("pageviews").textContent = data.pageviews || 0;
-      document.getElementById("clicks").textContent = data.clicks || 0;
-      document.getElementById("success").textContent = data.success || 0;
-      document.getElementById("errors").textContent = data.errors || 0;
+      document.getElementById("pageviews").innerText = data.pageviews;
+      document.getElementById("clicks").innerText = data.clicks;
+      document.getElementById("success").innerText = data.success;
+      document.getElementById("errors").innerText = data.errors;
 
-      // Remplissage du tableau
       const tbody = document.getElementById("table-body");
       tbody.innerHTML = "";
-      data.daily.forEach(row => {
-        const tr = document.createElement("tr");
-        tr.innerHTML = `
-          <td>${row.date}</td>
-          <td>${row.pageviews}</td>
-          <td>${row.clicks}</td>
-          <td>${row.success}</td>
-          <td>${row.errors}</td>
-        `;
-        tbody.appendChild(tr);
+      data.daily.forEach(d => {
+        const row = `<tr>
+          <td>${d.date}</td>
+          <td>${d.pageviews}</td>
+          <td>${d.clicks}</td>
+          <td>${d.success}</td>
+          <td>${d.errors}</td>
+        </tr>`;
+        tbody.insertAdjacentHTML("beforeend", row);
       });
 
-      // Graphique
-      const labels = data.daily.map(r => r.date);
-      const clicks = data.daily.map(r => r.clicks);
-      const success = data.daily.map(r => r.success);
-      const errors = data.daily.map(r => r.errors);
+      updateChart(data.daily);
+    }
+
+    let chart;
+    function updateChart(daily) {
+      const ctx = document.getElementById("chart");
+      const labels = daily.map(d => d.date);
+      const views = daily.map(d => d.pageviews);
+      const clicks = daily.map(d => d.clicks);
+      const success = daily.map(d => d.success);
 
       if (chart) chart.destroy();
-      chart = new Chart(chartCtx, {
+      chart = new Chart(ctx, {
         type: 'line',
         data: {
           labels,
           datasets: [
-            { label: 'Calculs', data: clicks, borderColor: '#007bff', fill: false },
-            { label: 'Succès', data: success, borderColor: '#28a745', fill: false },
-            { label: 'Erreurs', data: errors, borderColor: '#dc3545', fill: false }
+            { label: 'Pages vues', data: views, borderColor: '#004aad', tension: 0.3 },
+            { label: 'Simulations', data: clicks, borderColor: '#ff9f00', tension: 0.3 },
+            { label: 'Réussites', data: success, borderColor: '#4caf50', tension: 0.3 }
           ]
         },
         options: {
           responsive: true,
-          plugins: { legend: { position: 'bottom' } },
+          plugins: {
+            legend: { position: 'bottom' }
+          },
           scales: {
-            x: { ticks: { maxRotation: 45, minRotation: 45 } },
+            x: { grid: { display: false } },
             y: { beginAtZero: true }
           }
         }
       });
     }
 
-    daysSelect.addEventListener("change", () => loadStats(daysSelect.value));
-    loadStats(30);
+    refreshStats();
   </script>
 </body>
 </html>
