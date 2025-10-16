@@ -1,150 +1,302 @@
-from fastapi import FastAPI, Request
+# app_pricer_cors.py — version complète et corrigée
+from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, FileResponse
-from pricer_engine import compute_annuity
-from datetime import datetime, timedelta
-import psycopg
-import os
+from fastapi.responses import (
+    RedirectResponse, Response, FileResponse, HTMLResponse, JSONResponse
+)
+from pydantic import BaseModel
+from typing import Literal, Optional, Dict, List
+from datetime import datetime, timezone, date, timedelta
+import os, csv, tempfile
 
-app = FastAPI()
+from pricer_engine import compute_annuity  # <-- ton moteur existant
 
-# --- CORS setup ---
+# =========================
+#  CORS (Netlify + local)
+# =========================
+ALLOWED_ORIGINS = [
+    "https://simulateur-price.netlify.app",
+    "http://localhost:8000",
+    "http://127.0.0.1:8000",
+]
+
+app = FastAPI(title="Simulateur Pricer")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# --- Database (Neon) ---
-DATABASE_URL = os.getenv(
-    "DATABASE_URL",
-    "postgresql://neondb_owner:YOUR_PASSWORD@YOUR_CLUSTER.neon.tech/neondb?sslmode=require"
-)
+# =========================
+#  Postgres (Neon)
+# =========================
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+use_db = False
+conn = None
 
-def init_db():
+def db_connect():
+    global conn, use_db
+    if not DATABASE_URL:
+        use_db = False
+        return
     try:
-        with psycopg.connect(DATABASE_URL) as conn:
-            with conn.cursor() as cur:
-                cur.execute("""
-                    CREATE TABLE IF NOT EXISTS events (
-                        id SERIAL PRIMARY KEY,
-                        timestamp TIMESTAMP DEFAULT NOW(),
-                        event_type TEXT,
-                        ip TEXT
-                    );
-                """)
-                conn.commit()
+        import psycopg  # psycopg[binary]
+        conn = psycopg.connect(DATABASE_URL, autocommit=True)
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS events (
+                    id BIGSERIAL PRIMARY KEY,
+                    ts_utc TIMESTAMPTZ NOT NULL DEFAULT (NOW() AT TIME ZONE 'UTC'),
+                    ip TEXT,
+                    ua TEXT,
+                    event TEXT NOT NULL,
+                    montant NUMERIC,
+                    devise TEXT,
+                    duree INT,
+                    retro TEXT,
+                    support TEXT,
+                    frais_contrat NUMERIC,
+                    rente NUMERIC,
+                    error TEXT
+                );
+            """)
+        use_db = True
         print("Postgres: CONNECTED & TABLE READY")
     except Exception as e:
-        print("Database init failed:", e)
+        print("Postgres disabled:", e)
+        use_db = False
 
-init_db()
+db_connect()
 
-# --- ROUTES ---
+# =========================
+#  Modèles I/O
+# =========================
+class ComputeRequest(BaseModel):
+    montant_disponible: float
+    devise: Literal["EUR", "USD"]
+    duree: int
+    retrocessions: Literal["oui", "non"]
+    frais_contrat: float = 0.0
 
-@app.get("/")
-def root():
-    return {"message": "API du simulateur de rente est en ligne ✅"}
+# ATTENTION: ce schéma correspond à la réponse attendue par ton index.html
+class ComputeResponse(BaseModel):
+    rente_annuelle_arrondie: float
+    gestion_rate: float
+    retro_rate: float
+    garde_rate: float
+    frais_contrat: float
+    total_frais: float
 
+class CollectEvent(BaseModel):
+    event: Literal["pageview", "calculate_click", "calculate_success", "calculate_error"]
+    montant: Optional[float] = None
+    devise: Optional[Literal["EUR", "USD"]] = None
+    duree: Optional[int] = None
+    retro: Optional[Literal["oui", "non"]] = None
+    support: Optional[Literal["assurance-vie", "compte-titres"]] = None
+    frais_contrat: Optional[float] = None
+    rente: Optional[float] = None
+    error: Optional[str] = None
 
-# ---------------- COMPUTE ----------------
-@app.post("/compute")
-async def compute(data: dict):
+# =========================
+#  Utils DB
+# =========================
+def append_event_db(row: dict):
+    if not use_db or conn is None:
+        return
     try:
-        result = compute_annuity(data)
-        return JSONResponse({"result": result})
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO events
+                (ts_utc, ip, ua, event, montant, devise, duree, retro, support, frais_contrat, rente, error)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s);
+            """, (
+                row.get("ts_utc"),
+                row.get("ip"),
+                row.get("ua"),
+                row.get("event"),
+                row.get("montant"),
+                row.get("devise"),
+                row.get("duree"),
+                row.get("retro"),
+                row.get("support"),
+                row.get("frais_contrat"),
+                row.get("rente"),
+                row.get("error"),
+            ))
     except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=500)
+        print("append_event_db error:", e)
 
-
-# ---------------- TRACKING ----------------
-@app.post("/collect")
-async def collect_event(request: Request):
-    data = await request.json()
-    event_type = data.get("event_type", "unknown")
-    ip = request.client.host
+def load_events_db(days: Optional[int] = None) -> List[Dict[str, str]]:
+    if not use_db or conn is None:
+        return []
     try:
-        with psycopg.connect(DATABASE_URL) as conn:
-            with conn.cursor() as cur:
-                cur.execute("INSERT INTO events (event_type, ip) VALUES (%s, %s)", (event_type, ip))
-                conn.commit()
-        return {"status": "ok"}
-    except Exception as e:
-        return {"error": str(e)}
-
-
-@app.get("/stats")
-def get_stats(days: int = 30):
-    try:
-        since = datetime.now() - timedelta(days=days)
-        with psycopg.connect(DATABASE_URL) as conn:
-            with conn.cursor() as cur:
+        with conn.cursor() as cur:
+            if days:
                 cur.execute("""
-                    SELECT event_type, DATE(timestamp)
+                    SELECT ts_utc, ip, ua, event, montant, devise, duree, retro, support, frais_contrat, rente, error
                     FROM events
-                    WHERE timestamp > %s
-                    ORDER BY timestamp ASC
-                """, (since,))
-                rows = cur.fetchall()
-
-        daily = {}
-        for event, date in rows:
-            date_str = date.strftime("%Y-%m-%d")
-            if date_str not in daily:
-                daily[date_str] = {"pageviews": 0, "clicks": 0, "success": 0, "errors": 0}
-            if event == "pageview":
-                daily[date_str]["pageviews"] += 1
-            elif event == "calculate_click":
-                daily[date_str]["clicks"] += 1
-            elif event == "calculate_success":
-                daily[date_str]["success"] += 1
-            elif event == "calculate_error":
-                daily[date_str]["errors"] += 1
-
-        total = {"pageviews": 0, "clicks": 0, "success": 0, "errors": 0}
-        for d in daily.values():
-            for k in total:
-                total[k] += d[k]
-
-        return {
-            **total,
-            "daily": [
-                {"date": d, **daily[d]} for d in sorted(daily.keys())
-            ]
-        }
-
+                    WHERE ts_utc >= (NOW() AT TIME ZONE 'UTC') - INTERVAL %s
+                    ORDER BY ts_utc ASC;
+                """, (f"{days} days",))
+            else:
+                cur.execute("""
+                    SELECT ts_utc, ip, ua, event, montant, devise, duree, retro, support, frais_contrat, rente, error
+                    FROM events
+                    ORDER BY ts_utc ASC;
+                """)
+            rows = cur.fetchall()
+        result = []
+        for r in rows:
+            result.append({
+                "ts_utc": r[0].isoformat(),
+                "ip": r[1] or "",
+                "ua": r[2] or "",
+                "event": r[3] or "",
+                "montant": float(r[4]) if r[4] is not None else None,
+                "devise": r[5] or "",
+                "duree": int(r[6]) if r[6] is not None else None,
+                "retro": r[7] or "",
+                "support": r[8] or "",
+                "frais_contrat": float(r[9]) if r[9] is not None else None,
+                "rente": float(r[10]) if r[10] is not None else None,
+                "error": r[11] or "",
+            })
+        return result
     except Exception as e:
-        return {"error": str(e)}
+        print("load_events_db error:", e)
+        return []
 
+# =========================
+#  Routes confort
+# =========================
+@app.get("/", include_in_schema=False)
+def root():
+    return RedirectResponse(url="/docs")
 
+@app.get("/favicon.ico", include_in_schema=False)
+def favicon():
+    return Response(status_code=204)
+
+@app.get("/health")
+def health():
+    return {"status": "ok", "db": use_db}
+
+# =========================
+#  /compute — FIX: signature correcte
+# =========================
+@app.post("/compute", response_model=ComputeResponse)
+def compute(req: ComputeRequest):
+    """
+    Renvoie EXACTEMENT la structure attendue par le front :
+    {
+      rente_annuelle_arrondie, gestion_rate, retro_rate, garde_rate, frais_contrat, total_frais
+    }
+    """
+    try:
+        res = compute_annuity(
+            amount=req.montant_disponible,
+            currency=req.devise,
+            years=req.duree,
+            include_retro=(req.retrocessions == "oui"),
+            extra_contract_fee=req.frais_contrat,
+        )
+        # res est déjà conforme au schéma ComputeResponse
+        return res
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Erreur moteur : {str(e)}")
+
+# =========================
+#  /collect — tracking persistant Neon
+# =========================
+@app.post("/collect")
+async def collect(event: CollectEvent, request: Request):
+    ip = request.client.host if request.client else "-"
+    ua = request.headers.get("user-agent", "-")
+    row = {
+        "ts_utc": datetime.now(timezone.utc).isoformat(),
+        "ip": ip,
+        "ua": ua[:300],
+        "event": event.event,
+        "montant": event.montant,
+        "devise": event.devise,
+        "duree": event.duree,
+        "retro": event.retro,
+        "support": event.support,
+        "frais_contrat": event.frais_contrat,
+        "rente": event.rente,
+        "error": (event.error or "")[:300],
+    }
+    if use_db:
+        append_event_db(row)
+    return {"ok": True}
+
+# =========================
+#  /events.csv — export complet
+# =========================
 @app.get("/events.csv")
 def export_csv():
-    try:
-        with psycopg.connect(DATABASE_URL) as conn:
-            with conn.cursor() as cur:
-                cur.execute("SELECT id, timestamp, event_type, ip FROM events ORDER BY timestamp DESC")
-                rows = cur.fetchall()
-
-        csv_content = "id,timestamp,event_type,ip\n"
+    rows = load_events_db() if use_db else []
+    # créer un CSV temporaire
+    fd, tmp_path = tempfile.mkstemp(prefix="events_", suffix=".csv")
+    os.close(fd)
+    with open(tmp_path, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow([
+            "ts_utc","ip","ua","event","montant","devise","duree","retro","support","frais_contrat","rente","error"
+        ])
         for r in rows:
-            csv_content += f"{r[0]},{r[1]},{r[2]},{r[3]}\n"
+            w.writerow([
+                r["ts_utc"], r["ip"], r["ua"], r["event"], r["montant"], r["devise"],
+                r["duree"], r["retro"], r["support"], r["frais_contrat"], r["rente"], r["error"]
+            ])
+    return FileResponse(tmp_path, media_type="text/csv", filename="events_log.csv")
 
-        return FileResponse(
-            path=None,
-            media_type="text/csv",
-            filename="events.csv",
-            headers={"Content-Disposition": "inline"},
-            content=csv_content.encode("utf-8"),
-        )
+# =========================
+#  /stats — JSON pour dashboard
+# =========================
+@app.get("/stats", response_class=JSONResponse)
+def stats(days: int = 30):
+    days = max(1, min(days, 365))
+    data = load_events_db(days=days) if use_db else []
 
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=500)
+    # totaux
+    pageviews = sum(1 for r in data if r["event"] == "pageview")
+    clicks    = sum(1 for r in data if r["event"] == "calculate_click")
+    success   = sum(1 for r in data if r["event"] == "calculate_success")
+    errors    = sum(1 for r in data if r["event"] == "calculate_error")
 
+    # série quotidienne
+    end = date.today()
+    start = end - timedelta(days=days - 1)
+    per_day = { (start + timedelta(d)).isoformat(): {"pageviews":0,"clicks":0,"success":0,"errors":0}
+                for d in range(days) }
+    for r in data:
+        d = r["ts_utc"][:10]  # YYYY-MM-DD
+        if d in per_day:
+            if r["event"] == "pageview": per_day[d]["pageviews"] += 1
+            elif r["event"] == "calculate_click": per_day[d]["clicks"] += 1
+            elif r["event"] == "calculate_success": per_day[d]["success"] += 1
+            elif r["event"] == "calculate_error": per_day[d]["errors"] += 1
 
-# ---------------- SERVE STATS.HTML ----------------
-@app.get("/stats.html")
-async def serve_stats_html():
+    daily = [{"date": d, **per_day[d]} for d in sorted(per_day.keys())]
+
+    # On renvoie à la fois un format simple et compatible avec ton nouveau stats.html
+    return {
+        "range_days": days,
+        "pageviews": pageviews,
+        "clicks": clicks,
+        "success": success,
+        "errors": errors,
+        "daily": daily
+    }
+
+# =========================
+#  /stats.html — fichier dashboard statique
+# =========================
+@app.get("/stats.html", response_class=FileResponse)
+def serve_stats_html():
     file_path = os.path.join(os.path.dirname(__file__), "stats.html")
     return FileResponse(file_path, media_type="text/html")
