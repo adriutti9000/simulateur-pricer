@@ -1,4 +1,3 @@
-# app_pricer_cors.py — version avec correctifs SQL interval + timezone Europe/Luxembourg
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import (
@@ -6,11 +5,11 @@ from fastapi.responses import (
 )
 from pydantic import BaseModel
 from typing import Literal, Optional, Dict, List
-from datetime import datetime, timezone, date, timedelta
+from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 import os, csv, tempfile
 
-from pricer_engine import compute_annuity  # moteur existant
+from pricer_engine import compute_annuity  # ton moteur existant
 
 # ---------------- CORS ----------------
 ALLOWED_ORIGINS = [
@@ -123,15 +122,14 @@ def append_event_db(row: dict):
 
 def load_events_db(days: Optional[int] = None) -> List[Dict[str, str]]:
     """
-    Corrigé : on n'utilise plus `INTERVAL $1` (non paramétrable).
-    On passe un entier et on construit un interval propre côté SQL via make_interval.
+    Corrigé : on n'utilise plus INTERVAL $1 (non paramétrable en psycopg)
+    mais make_interval(days => %s) qui accepte un entier.
     """
     if not use_db or conn is None:
         return []
     try:
         with conn.cursor() as cur:
             if days:
-                # Utilise make_interval(days => %s) pour un param entier
                 cur.execute("""
                     SELECT ts_utc, ip, ua, event, montant, devise, duree, retro, support, frais_contrat, rente, error
                     FROM events
@@ -145,6 +143,7 @@ def load_events_db(days: Optional[int] = None) -> List[Dict[str, str]]:
                     ORDER BY ts_utc ASC;
                 """)
             rows = cur.fetchall()
+
         result = []
         for r in rows:
             result.append({
@@ -220,13 +219,13 @@ async def collect(event: CollectEvent, request: Request):
 @app.get("/events.csv")
 def export_csv():
     rows = load_events_db() if use_db else []
-    # CSV temporaire
     fd, tmp_path = tempfile.mkstemp(prefix="events_", suffix=".csv")
     os.close(fd)
     with open(tmp_path, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
         w.writerow([
-            "ts_utc","ip","ua","event","montant","devise","duree","retro","support","frais_contrat","rente","error"
+            "ts_utc","ip","ua","event","montant","devise","duree",
+            "retro","support","frais_contrat","rente","error"
         ])
         for r in rows:
             w.writerow([
@@ -238,32 +237,24 @@ def export_csv():
 # ---------------- /stats (JSON) ----------------
 @app.get("/stats", response_class=JSONResponse)
 def stats(days: int = 30):
-    """
-    Corrigé :
-    - lecture DB avec interval paramétré
-    - agrégation par JOUR en timezone Europe/Luxembourg
-    """
     days = max(1, min(days, 365))
     data = load_events_db(days=days) if use_db else []
 
-    # Totaux simples
     pageviews = sum(1 for r in data if r["event"] == "pageview")
     clicks    = sum(1 for r in data if r["event"] == "calculate_click")
     success   = sum(1 for r in data if r["event"] == "calculate_success")
     errors    = sum(1 for r in data if r["event"] == "calculate_error")
 
-    # Dates en timezone Europe/Luxembourg
     lux = ZoneInfo("Europe/Luxembourg")
     end = datetime.now(lux).date()
     start = end - timedelta(days=days - 1)
 
-    per_day: Dict[str, Dict[str, int]] = {
+    per_day = {
         (start + timedelta(d)).isoformat(): {"pageviews":0,"clicks":0,"success":0,"errors":0}
         for d in range(days)
     }
 
     for r in data:
-        # ts_utc est en ISO UTC → on le convertit en Europe/Luxembourg pour bucketiser
         try:
             ts = datetime.fromisoformat(r["ts_utc"].replace("Z", "+00:00"))
         except Exception:
@@ -287,7 +278,7 @@ def stats(days: int = 30):
         "daily": daily
     }
 
-# ---------------- /stats.html (fichier) ----------------
+# ---------------- /stats.html ----------------
 @app.get("/stats.html", response_class=FileResponse)
 def serve_stats_html():
     file_path = os.path.join(os.path.dirname(__file__), "stats.html")
