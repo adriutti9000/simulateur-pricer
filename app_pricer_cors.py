@@ -1,4 +1,3 @@
-# app_pricer_cors.py — version complète et corrigée
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import (
@@ -6,14 +5,13 @@ from fastapi.responses import (
 )
 from pydantic import BaseModel
 from typing import Literal, Optional, Dict, List
-from datetime import datetime, timezone, date, timedelta
+from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 import os, csv, tempfile
 
-from pricer_engine import compute_annuity  # <-- ton moteur existant
+from pricer_engine import compute_annuity  # ton moteur existant
 
-# =========================
-#  CORS (Netlify + local)
-# =========================
+# ---------------- CORS ----------------
 ALLOWED_ORIGINS = [
     "https://simulateur-price.netlify.app",
     "http://localhost:8000",
@@ -29,9 +27,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# =========================
-#  Postgres (Neon)
-# =========================
+# ---------------- DB (Neon) ----------------
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 use_db = False
 conn = None
@@ -70,9 +66,7 @@ def db_connect():
 
 db_connect()
 
-# =========================
-#  Modèles I/O
-# =========================
+# ---------------- Schémas ----------------
 class ComputeRequest(BaseModel):
     montant_disponible: float
     devise: Literal["EUR", "USD"]
@@ -80,7 +74,6 @@ class ComputeRequest(BaseModel):
     retrocessions: Literal["oui", "non"]
     frais_contrat: float = 0.0
 
-# ATTENTION: ce schéma correspond à la réponse attendue par ton index.html
 class ComputeResponse(BaseModel):
     rente_annuelle_arrondie: float
     gestion_rate: float
@@ -100,9 +93,7 @@ class CollectEvent(BaseModel):
     rente: Optional[float] = None
     error: Optional[str] = None
 
-# =========================
-#  Utils DB
-# =========================
+# ---------------- Helpers DB ----------------
 def append_event_db(row: dict):
     if not use_db or conn is None:
         return
@@ -130,6 +121,10 @@ def append_event_db(row: dict):
         print("append_event_db error:", e)
 
 def load_events_db(days: Optional[int] = None) -> List[Dict[str, str]]:
+    """
+    Corrigé : on n'utilise plus INTERVAL $1 (non paramétrable en psycopg)
+    mais make_interval(days => %s) qui accepte un entier.
+    """
     if not use_db or conn is None:
         return []
     try:
@@ -138,9 +133,9 @@ def load_events_db(days: Optional[int] = None) -> List[Dict[str, str]]:
                 cur.execute("""
                     SELECT ts_utc, ip, ua, event, montant, devise, duree, retro, support, frais_contrat, rente, error
                     FROM events
-                    WHERE ts_utc >= (NOW() AT TIME ZONE 'UTC') - INTERVAL %s
+                    WHERE ts_utc >= (NOW() AT TIME ZONE 'UTC') - make_interval(days => %s)
                     ORDER BY ts_utc ASC;
-                """, (f"{days} days",))
+                """, (int(days),))
             else:
                 cur.execute("""
                     SELECT ts_utc, ip, ua, event, montant, devise, duree, retro, support, frais_contrat, rente, error
@@ -148,6 +143,7 @@ def load_events_db(days: Optional[int] = None) -> List[Dict[str, str]]:
                     ORDER BY ts_utc ASC;
                 """)
             rows = cur.fetchall()
+
         result = []
         for r in rows:
             result.append({
@@ -169,9 +165,7 @@ def load_events_db(days: Optional[int] = None) -> List[Dict[str, str]]:
         print("load_events_db error:", e)
         return []
 
-# =========================
-#  Routes confort
-# =========================
+# ---------------- Routes confort ----------------
 @app.get("/", include_in_schema=False)
 def root():
     return RedirectResponse(url="/docs")
@@ -184,33 +178,21 @@ def favicon():
 def health():
     return {"status": "ok", "db": use_db}
 
-# =========================
-#  /compute — FIX: signature correcte
-# =========================
+# ---------------- /compute ----------------
 @app.post("/compute", response_model=ComputeResponse)
 def compute(req: ComputeRequest):
-    """
-    Renvoie EXACTEMENT la structure attendue par le front :
-    {
-      rente_annuelle_arrondie, gestion_rate, retro_rate, garde_rate, frais_contrat, total_frais
-    }
-    """
     try:
-        res = compute_annuity(
+        return compute_annuity(
             amount=req.montant_disponible,
             currency=req.devise,
             years=req.duree,
             include_retro=(req.retrocessions == "oui"),
             extra_contract_fee=req.frais_contrat,
         )
-        # res est déjà conforme au schéma ComputeResponse
-        return res
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Erreur moteur : {str(e)}")
 
-# =========================
-#  /collect — tracking persistant Neon
-# =========================
+# ---------------- /collect ----------------
 @app.post("/collect")
 async def collect(event: CollectEvent, request: Request):
     ip = request.client.host if request.client else "-"
@@ -233,19 +215,17 @@ async def collect(event: CollectEvent, request: Request):
         append_event_db(row)
     return {"ok": True}
 
-# =========================
-#  /events.csv — export complet
-# =========================
+# ---------------- /events.csv ----------------
 @app.get("/events.csv")
 def export_csv():
     rows = load_events_db() if use_db else []
-    # créer un CSV temporaire
     fd, tmp_path = tempfile.mkstemp(prefix="events_", suffix=".csv")
     os.close(fd)
     with open(tmp_path, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
         w.writerow([
-            "ts_utc","ip","ua","event","montant","devise","duree","retro","support","frais_contrat","rente","error"
+            "ts_utc","ip","ua","event","montant","devise","duree",
+            "retro","support","frais_contrat","rente","error"
         ])
         for r in rows:
             w.writerow([
@@ -254,36 +234,41 @@ def export_csv():
             ])
     return FileResponse(tmp_path, media_type="text/csv", filename="events_log.csv")
 
-# =========================
-#  /stats — JSON pour dashboard
-# =========================
+# ---------------- /stats (JSON) ----------------
 @app.get("/stats", response_class=JSONResponse)
 def stats(days: int = 30):
     days = max(1, min(days, 365))
     data = load_events_db(days=days) if use_db else []
 
-    # totaux
     pageviews = sum(1 for r in data if r["event"] == "pageview")
     clicks    = sum(1 for r in data if r["event"] == "calculate_click")
     success   = sum(1 for r in data if r["event"] == "calculate_success")
     errors    = sum(1 for r in data if r["event"] == "calculate_error")
 
-    # série quotidienne
-    end = date.today()
+    lux = ZoneInfo("Europe/Luxembourg")
+    end = datetime.now(lux).date()
     start = end - timedelta(days=days - 1)
-    per_day = { (start + timedelta(d)).isoformat(): {"pageviews":0,"clicks":0,"success":0,"errors":0}
-                for d in range(days) }
+
+    per_day = {
+        (start + timedelta(d)).isoformat(): {"pageviews":0,"clicks":0,"success":0,"errors":0}
+        for d in range(days)
+    }
+
     for r in data:
-        d = r["ts_utc"][:10]  # YYYY-MM-DD
-        if d in per_day:
-            if r["event"] == "pageview": per_day[d]["pageviews"] += 1
-            elif r["event"] == "calculate_click": per_day[d]["clicks"] += 1
-            elif r["event"] == "calculate_success": per_day[d]["success"] += 1
-            elif r["event"] == "calculate_error": per_day[d]["errors"] += 1
+        try:
+            ts = datetime.fromisoformat(r["ts_utc"].replace("Z", "+00:00"))
+        except Exception:
+            continue
+        ts_local = ts.astimezone(lux)
+        dkey = ts_local.date().isoformat()
+        if dkey in per_day:
+            if r["event"] == "pageview": per_day[dkey]["pageviews"] += 1
+            elif r["event"] == "calculate_click": per_day[dkey]["clicks"] += 1
+            elif r["event"] == "calculate_success": per_day[dkey]["success"] += 1
+            elif r["event"] == "calculate_error": per_day[dkey]["errors"] += 1
 
     daily = [{"date": d, **per_day[d]} for d in sorted(per_day.keys())]
 
-    # On renvoie à la fois un format simple et compatible avec ton nouveau stats.html
     return {
         "range_days": days,
         "pageviews": pageviews,
@@ -293,9 +278,7 @@ def stats(days: int = 30):
         "daily": daily
     }
 
-# =========================
-#  /stats.html — fichier dashboard statique
-# =========================
+# ---------------- /stats.html ----------------
 @app.get("/stats.html", response_class=FileResponse)
 def serve_stats_html():
     file_path = os.path.join(os.path.dirname(__file__), "stats.html")
