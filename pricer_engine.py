@@ -16,65 +16,80 @@ _CURVE: Dict[str, Dict[int, float]] = {
     },
 }
 
+# Barème rétrocessions (en décimal)
+def _retro_rate(amount: float) -> float:
+    if amount < 10_000_000:
+        return 0.0021  # 0,21 %
+    elif amount < 15_000_000:
+        return 0.0018  # 0,18 %
+    else:
+        return 0.0015  # 0,15 %
+
+# Barème frais de gestion quand rétrocessions = Oui  (déjà "tout compris" côté gestion)
+def _gestion_rate_with_retro(amount: float) -> float:
+    if amount < 10_000_000:
+        return 0.0049  # 0,49 %
+    elif amount < 15_000_000:
+        return 0.0042  # 0,42 %
+    else:
+        return 0.0035  # 0,35 %
+
+# Barème frais de gestion quand rétrocessions = Non
+def _gestion_rate_without_retro(amount: float) -> float:
+    if amount < 10_000_000:
+        return 0.0060  # 0,60 %
+    elif amount < 15_000_000:
+        return 0.0050  # 0,50 %
+    else:
+        return 0.0040  # 0,40 %
+
 def compute_annuity(
     amount: float,
     currency: str,
     years: int,
     include_retro: bool,
-    extra_contract_fee: float = 0.0,
+    extra_contract_fee: float = 0.0,  # ex: 0.001 = 0,10 %
 ) -> Dict[str, float]:
-    """Calcule la rente annuelle nette et les frais (même logique que ton fichier, avec corrections demandées)."""
+    """
+    Retourne :
+      - rente_annuelle_arrondie (entier, sans décimales)
+      - gestion_rate, retro_rate, garde_rate, frais_contrat, total_frais (décimaux)
+    Rente nette utilisée côté front : amount * curve_rate * (1 - total_frais)
+    """
     if currency not in _CURVE:
         raise ValueError(f"Devise non supportée : {currency}")
     if years not in _CURVE[currency]:
         raise ValueError(f"Durée non disponible : {years} ans")
 
-    rate = _CURVE[currency][years] / 100.0  # taux en décimal
+    # Taux "marché" de la courbe (en décimal)
+    curve_rate = _CURVE[currency][years] / 100.0
 
-    # Barème rétrocessions (toujours calculé, mais pris en compte seulement si include_retro)
-    if amount < 10_000_000:
-        retro_rate = 0.0021  # 0,21 %
-    elif amount < 15_000_000:
-        retro_rate = 0.0018  # 0,18 %
-    else:
-        retro_rate = 0.0015  # 0,15 %
-
-    # Barème frais de gestion (dépend de include_retro)
+    # Frais de gestion & rétro (affichage)
     if include_retro:
-        if amount < 10_000_000:
-            gestion_rate = 0.0049  # 0,49 %
-        elif amount < 15_000_000:
-            gestion_rate = 0.0042  # 0,42 %
-        else:
-            gestion_rate = 0.0035  # 0,35 %
-        # rétro affichée séparément, mais INCLUSE dans la logique des frais de gestion (pas retranchée du total)
+        gestion_rate = _gestion_rate_with_retro(amount)
+        retro_rate = _retro_rate(amount)   # affiché à part, mais DEJA inclus dans gestion_rate
     else:
-        if amount < 10_000_000:
-            gestion_rate = 0.0060  # 0,60 %
-        elif amount < 15_000_000:
-            gestion_rate = 0.0050  # 0,50 %
-        else:
-            gestion_rate = 0.0040  # 0,40 %
-        retro_rate = 0.0  # pas de rétro quand include_retro = False
+        gestion_rate = _gestion_rate_without_retro(amount)
+        retro_rate = 0.0
 
-    # ✅ Droits de garde = 0,10 %
+    # Droits de garde = 0,10 %
     garde_rate = 0.0010
 
-    # Frais d’assurance-vie (déjà en décimal, ex: 0.001 = 0,10 %)
-    frais_contrat = float(extra_contract_fee or 0.0)
+    # Frais d’assurance-vie (si support = assurance-vie)
+    contract_rate = max(0.0, float(extra_contract_fee or 0.0))
 
-    # ✅ Total des frais : on n’enlève JAMAIS la rétro (elle est incluse dans gestion_rate si applicable)
-    total_frais = gestion_rate + garde_rate + frais_contrat
+    # >>> TOTAL DES FRAIS SANS AUCUNE SOUSTRACTION DE LA RÉTRO <<<
+    total_frais = gestion_rate + garde_rate + contract_rate
 
-    # Rente nette (arrondie sans décimales, comme demandé)
-    rente_nette = amount * rate * (1 - total_frais)
+    # Rente nette annuelle (pas de décimales)
+    rente_nette = amount * curve_rate * (1.0 - total_frais)
     rente_arrondie = int(round(rente_nette))
 
     return {
-        "rente_annuelle_arrondie": rente_arrondie,  # entier, sans décimales
-        "gestion_rate": gestion_rate,
-        "retro_rate": retro_rate,
-        "garde_rate": garde_rate,
-        "frais_contrat": frais_contrat,
-        "total_frais": total_frais,
+        "rente_annuelle_arrondie": rente_arrondie,
+        "gestion_rate": round(gestion_rate, 6),
+        "retro_rate": round(retro_rate, 6),
+        "garde_rate": round(garde_rate, 6),
+        "frais_contrat": round(contract_rate, 6),
+        "total_frais": round(total_frais, 6),
     }
