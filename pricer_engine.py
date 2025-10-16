@@ -23,54 +23,55 @@ def compute_annuity(
     include_retro: bool,
     extra_contract_fee: float = 0.0,
 ) -> Dict[str, float]:
-    """Calcule la rente annuelle nette et les frais, en conservant la logique précédente."""
+    """Calcule la rente annuelle nette et les frais (même logique que ton fichier, avec corrections demandées)."""
     if currency not in _CURVE:
         raise ValueError(f"Devise non supportée : {currency}")
     if years not in _CURVE[currency]:
         raise ValueError(f"Durée non disponible : {years} ans")
 
-    rate = _CURVE[currency][years] / 100.0  # en décimal
+    rate = _CURVE[currency][years] / 100.0  # taux en décimal
 
-    # Barème rétrocessions
+    # Barème rétrocessions (toujours calculé, mais pris en compte seulement si include_retro)
     if amount < 10_000_000:
-        retro_rate = 0.0021
+        retro_rate = 0.0021  # 0,21 %
     elif amount < 15_000_000:
-        retro_rate = 0.0018
+        retro_rate = 0.0018  # 0,18 %
     else:
-        retro_rate = 0.0015
+        retro_rate = 0.0015  # 0,15 %
 
-    # Barème frais de gestion (dépend du rétro)
+    # Barème frais de gestion (dépend de include_retro)
     if include_retro:
         if amount < 10_000_000:
-            gestion_rate = 0.0049
+            gestion_rate = 0.0049  # 0,49 %
         elif amount < 15_000_000:
-            gestion_rate = 0.0042
+            gestion_rate = 0.0042  # 0,42 %
         else:
-            gestion_rate = 0.0035
+            gestion_rate = 0.0035  # 0,35 %
+        # rétro affichée séparément, mais INCLUSE dans la logique des frais de gestion (pas retranchée du total)
     else:
         if amount < 10_000_000:
-            gestion_rate = 0.0060
+            gestion_rate = 0.0060  # 0,60 %
         elif amount < 15_000_000:
-            gestion_rate = 0.0050
+            gestion_rate = 0.0050  # 0,50 %
         else:
-            gestion_rate = 0.0040
-        retro_rate = 0.0  # pas de rétro
+            gestion_rate = 0.0040  # 0,40 %
+        retro_rate = 0.0  # pas de rétro quand include_retro = False
 
-    # ✅ Droits de garde = 0,10%
+    # ✅ Droits de garde = 0,10 %
     garde_rate = 0.0010
 
-    # Frais de contrat (assurance-vie)
-    frais_contrat = extra_contract_fee or 0.0
+    # Frais d’assurance-vie (déjà en décimal, ex: 0.001 = 0,10 %)
+    frais_contrat = float(extra_contract_fee or 0.0)
 
-    # Total des frais (les rétro sont incluses dans gestion_rate si applicable)
+    # ✅ Total des frais : on n’enlève JAMAIS la rétro (elle est incluse dans gestion_rate si applicable)
     total_frais = gestion_rate + garde_rate + frais_contrat
 
-    # Rente nette (le front affichera sans décimales)
+    # Rente nette (arrondie sans décimales, comme demandé)
     rente_nette = amount * rate * (1 - total_frais)
-    rente_arrondie = round(rente_nette, 2)
+    rente_arrondie = int(round(rente_nette))
 
     return {
-        "rente_annuelle_arrondie": rente_arrondie,
+        "rente_annuelle_arrondie": rente_arrondie,  # entier, sans décimales
         "gestion_rate": gestion_rate,
         "retro_rate": retro_rate,
         "garde_rate": garde_rate,
