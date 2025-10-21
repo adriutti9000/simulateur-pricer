@@ -1,4 +1,4 @@
 fastapi
 uvicorn[standard]
 pydantic>=2
-psycopg[binary]
+psycopg[binary,pool]==3.2.10
