@@ -347,7 +347,7 @@ def stats_html():
       const periodEl  = document.getElementById('period');
       let chart;
 
-      function nb(x){ return new Intl.NumberFormat('fr-FR').format(x||0); }
+      function nb(x){{ return new Intl.NumberFormat('fr-FR').format(x||0); }}
       function setStatus(t){ statusEl.textContent = t || "" }
 
       async function load(){
