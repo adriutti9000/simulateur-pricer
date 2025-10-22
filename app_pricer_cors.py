@@ -9,7 +9,7 @@
 # ---------------------------------------------------------
 
 import os, json, textwrap, time
-from typing import Any, Dict, Optional, Callable
+from typing import Any, Optional, Callable
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, HTMLResponse, PlainTextResponse
@@ -27,7 +27,7 @@ from psycopg.errors import OperationalError, InterfaceError
 app = FastAPI(title="Simulateur Pricer API")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],            # si besoin, remplace par ton domaine Netlify
+    allow_origins=["*"],  # tu peux restreindre à ton domaine Netlify
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -55,7 +55,6 @@ def _build_pool() -> Optional[ConnectionPool]:
 
 def _ensure_schema(conn: psycopg.Connection) -> None:
     """Crée la table si besoin et ajoute les colonnes manquantes (migrations douces)."""
-    # Table minimale (certaines anciennes versions n’avaient pas ref/payload)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS events(
             id BIGSERIAL PRIMARY KEY,
@@ -66,7 +65,7 @@ def _ensure_schema(conn: psycopg.Connection) -> None:
             payload JSONB
         );
     """)
-    # Ajoute les colonnes manquantes
+    # Ajouts tolérants — certaines anciennes versions n’avaient pas ces colonnes
     conn.execute("ALTER TABLE events ADD COLUMN IF NOT EXISTS ref TEXT;")
     conn.execute("ALTER TABLE events ADD COLUMN IF NOT EXISTS payload JSONB;")
     conn.execute("ALTER TABLE events ADD COLUMN IF NOT EXISTS ua TEXT;")
@@ -108,7 +107,7 @@ def _with_db(action: Callable[[psycopg.Connection], Any]) -> Any:
             except Exception:
                 pass
             _pool = None
-            time.sleep(0.2 * (attempt + 1))
+            time.sleep(0.25 * (attempt + 1))
         except Exception as e:
             print("DB action error:", e)
             return None
@@ -120,9 +119,9 @@ class ComputeIn(BaseModel):
     devise: str
     duree: int
     retrocessions: str     # "oui" / "non"
-    frais_contrat: float = 0.0  # décimal (ex: 0.001 = 0,10 %)
+    frais_contrat: float = 0.0  # décimal (0.001 = 0,10 %)
 
-# -------------------- Routes --------------------
+# -------------------- Routes cœur --------------------
 @app.get("/health", include_in_schema=False)
 def health():
     ok = _with_db(lambda c: 1) is not None
@@ -171,6 +170,7 @@ async def collect(request: Request):
     _with_db(_insert)
     return {"ok": True}
 
+# -------------------- Exports & stats API --------------------
 @app.get("/events.csv")
 def events_csv():
     def _load(conn: psycopg.Connection):
@@ -189,7 +189,7 @@ def events_csv():
 @app.get("/stats")
 def stats(days: int = 30):
     days = max(1, min(days, 365))
-    out = {"days": days, "by_day": [], "last": 0, "by_event": []}
+    out = {"days": days, "by_day": [], "last": 0, "by_event": [], "total": 0, "unique_ips": 0}
 
     def _query(conn: psycopg.Connection):
         by_day = conn.execute(
@@ -215,62 +215,78 @@ def stats(days: int = 30):
             """,
             (days,),
         ).fetchall()
-        return by_day, last, by_event
+        total = conn.execute(
+            "SELECT COUNT(*) AS n FROM events WHERE ts_utc >= (NOW() AT TIME ZONE 'UTC') - make_interval(days => %s);",
+            (days,),
+        ).fetchone()["n"]
+        unique_ips = conn.execute(
+            "SELECT COUNT(DISTINCT ip) AS n FROM events WHERE ts_utc >= (NOW() AT TIME ZONE 'UTC') - make_interval(days => %s);",
+            (days,),
+        ).fetchone()["n"]
+        return by_day, last, by_event, total, unique_ips
 
     res = _with_db(_query)
     if res:
-        by_day, last, by_event = res
+        by_day, last, by_event, total, unique_ips = res
         out["by_day"] = [{"day": str(r["day"])[:10], "n": int(r["n"])} for r in by_day]
         out["last"] = int(last)
         out["by_event"] = [{"event": r["event"], "n": int(r["n"])} for r in by_event]
+        out["total"] = int(total)
+        out["unique_ips"] = int(unique_ips)
 
     return JSONResponse(out, headers={"Cache-Control": "no-store"})
 
-# -------------------- Dashboard intégré /stats.html (design ++, change période OK) --------------------
+# -------------------- Dashboard /stats.html (visuel ++, cache-busting, change période immédiat) --------------------
 @app.get("/stats.html", include_in_schema=False)
 def stats_html():
-    html = """
+    # CHANGELOG visible pour forcer le cache du navigateur à se rafraîchir :
+    VERSION = "v3.1"  # ← si tu ne vois pas le nouveau design, augmente ce tag (v3.2, v3.3, …)
+    html = f"""
     <!doctype html><html lang="fr"><meta charset="utf-8">
-    <title>Stats simulateur</title>
+    <title>Stats simulateur {VERSION}</title>
     <meta name="viewport" content="width=device-width,initial-scale=1">
     <meta http-equiv="Cache-Control" content="no-store" />
     <style>
-      :root{
-        --bg:#f6f8fb; --card:#fff; --text:#0f172a; --muted:#64748b; --border:#e6eaf2;
-        --primary:#1d5fd3; --primary-h:#184fb0;
-      }
-      *{box-sizing:border-box}
-      body{margin:0; font-family:system-ui, -apple-system, Segoe UI, Roboto, Arial; color:var(--text); background:var(--bg);}
-      .wrap{max-width:1100px; margin:28px auto; padding:0 16px;}
-      header{display:flex; justify-content:space-between; align-items:center; margin-bottom:14px}
-      h1{margin:0; font-size:22px}
-      .toolbar{display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin:10px 0 18px}
-      select,button,a{padding:8px 12px; border-radius:10px; border:1px solid var(--border); font-size:14px; background:#fff; color:var(--text); text-decoration:none}
-      button{background:var(--primary); color:#fff; border:none}
-      button:hover{background:var(--primary-h)}
-      .grid{display:grid; grid-template-columns:1fr 2fr; gap:16px}
-      @media (max-width:900px){ .grid{grid-template-columns:1fr} }
-      .card{background:var(--card); border:1px solid var(--border); border-radius:14px; padding:16px; box-shadow:0 4px 10px rgba(0,0,0,.04)}
-      .kpi{font-size:34px; font-weight:800}
-      .muted{color:var(--muted)}
-      /* ---- Chart ---- */
-      .chart-box{height:320px; position:relative}
-      .chart-box canvas{position:absolute; inset:0; width:100% !important; height:100% !important}
-      /* ---- Table stable ---- */
-      table{width:100%; border-collapse:collapse; table-layout:fixed}
-      th, td{padding:10px; border-bottom:1px solid var(--border); text-align:left; font-size:14px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis}
-      th{position:sticky; top:0; background:#fff; z-index:1}
-      .table-wrap{max-height:420px; overflow:auto; border:1px solid var(--border); border-radius:12px}
-      .cols-2{width:40%} .cols-1{width:60%}
-      .badge{display:inline-block; padding:4px 8px; border-radius:999px; background:#eef4ff; color:#1d5fd3; font-size:12px; margin-left:8px}
-      .info{margin-top:10px; font-size:13px; color:var(--muted)}
-      .status{margin-left:auto; font-size:13px; color:var(--muted)}
+      :root{{
+        --bg:#0b1220; --bg2:#0f172a; --card:#0f1b31; --edge:#213655; --text:#e6eefc; --muted:#94a3b8; --accent:#60a5fa;
+        --brand:#1d5fd3; --ok:#10b981; --warn:#f59e0b;
+      }}
+      *{{box-sizing:border-box}}
+      body{{margin:0; font-family:Inter, system-ui, -apple-system, Segoe UI, Roboto, Arial; color:var(--text); background:linear-gradient(180deg,var(--bg), var(--bg2));}}
+      .wrap{{max-width:1150px; margin:28px auto; padding:0 18px;}}
+      header.banner{{background:linear-gradient(90deg,#1d5fd3, #0ea5e9); border-radius:14px; padding:16px 18px; box-shadow:0 10px 30px rgba(0,0,0,.25);}}
+      header .title{{display:flex; align-items:baseline; gap:10px;}}
+      header h1{{margin:0; font-size:20px; font-weight:800; color:#fff}}
+      header .ver{{opacity:.85; color:#e2efff; font-size:12px; padding:2px 8px; border-radius:999px; background:rgba(255,255,255,.15)}}
+      .toolbar{{display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin:14px 0 18px}}
+      select,button,a{{padding:9px 12px; border-radius:10px; border:1px solid var(--edge); font-size:14px; background:#0d1a30; color:var(--text); text-decoration:none}}
+      button{{background:var(--brand); border:1px solid transparent}}
+      button:hover{{filter:brightness(1.08)}}
+      a:hover{{filter:brightness(1.12)}}
+      .grid{{display:grid; grid-template-columns:1.1fr 1.9fr; gap:16px}}
+      @media (max-width:980px){{ .grid{{grid-template-columns:1fr}} }}
+      .card{{background:var(--card); border:1px solid var(--edge); border-radius:14px; padding:16px; box-shadow:0 6px 20px rgba(0,0,0,.2)}}
+      .kpis{{display:grid; grid-template-columns:repeat(3,1fr); gap:12px}}
+      .kpi{{display:flex; flex-direction:column; gap:6px; background:#0c1527; border:1px solid var(--edge); border-radius:12px; padding:14px}}
+      .kpi .label{{color:var(--muted); font-size:12px}}
+      .kpi .val{{font-size:28px; font-weight:800; letter-spacing:.2px}}
+      .muted{{color:var(--muted)}}
+      .chart-box{{height:340px; position:relative}}
+      .chart-box canvas{{position:absolute; inset:0; width:100% !important; height:100% !important}}
+      table{{width:100%; border-collapse:collapse; table-layout:fixed}}
+      th, td{{padding:10px; border-bottom:1px solid var(--edge); text-align:left; font-size:14px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis}}
+      th{{position:sticky; top:0; background:#0e1a2d; z-index:1}}
+      .table-wrap{{max-height:420px; overflow:auto; border:1px solid var(--edge); border-radius:12px}}
+      .cols-2{{width:38%}} .cols-1{{width:62%}}
+      .status{{margin-left:auto; font-size:13px; color:var(--muted)}}
     </style>
 
     <div class="wrap">
-      <header>
-        <h1>Statistiques d’usage <span class="badge">Live</span></h1>
-        <a href="/events.csv" target="_blank">Télécharger le CSV</a>
+      <header class="banner">
+        <div class="title">
+          <h1>Statistiques d’usage</h1>
+          <span class="ver">{VERSION}</span>
+        </div>
       </header>
 
       <div class="toolbar">
@@ -281,99 +297,112 @@ def stats_html():
           <option value="90">90 jours</option>
         </select>
         <button id="refresh">Actualiser</button>
+        <a href="/events.csv" target="_blank">Télécharger le CSV</a>
         <span id="status" class="status"></span>
       </div>
 
-      <div class="grid">
-        <div class="card">
-          <div class="muted">Événements sur 24h</div>
-          <div id="kpi" class="kpi">–</div>
-          <div id="kpi-sub" class="info"></div>
+      <div class="kpis">
+        <div class="kpi">
+          <div class="label">Événements (24h)</div>
+          <div id="kpiLast" class="val">–</div>
         </div>
+        <div class="kpi">
+          <div class="label">Total sur période</div>
+          <div id="kpiTotal" class="val">–</div>
+        </div>
+        <div class="kpi">
+          <div class="label">Visiteurs (IP) uniques</div>
+          <div id="kpiIPs" class="val">–</div>
+        </div>
+      </div>
 
+      <div class="grid" style="margin-top:14px">
         <div class="card">
           <div class="muted" style="margin-bottom:8px">Événements par jour</div>
           <div class="chart-box"><canvas id="chart"></canvas></div>
         </div>
-      </div>
-
-      <div class="card" style="margin-top:16px">
-        <div class="muted" style="margin-bottom:8px">Par type d’événement</div>
-        <div class="table-wrap">
-          <table>
-            <thead>
-              <tr><th class="cols-1">Événement</th><th class="cols-2">Compteur</th></tr>
-            </thead>
-            <tbody id="byEvent"></tbody>
-          </table>
+        <div class="card">
+          <div class="muted" style="margin-bottom:8px">Par type d’événement</div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr><th class="cols-1">Événement</th><th class="cols-2">Compteur</th></tr>
+              </thead>
+              <tbody id="byEvent"></tbody>
+            </table>
+          </div>
+          <div id="period" class="muted" style="margin-top:10px"></div>
         </div>
-        <div id="totals" class="info"></div>
       </div>
     </div>
 
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <script>
       const statusEl = document.getElementById('status');
-      const kpiEl = document.getElementById('kpi');
-      const kpiSubEl = document.getElementById('kpi-sub');
+      const daysSel  = document.getElementById('days');
+      const kLast = document.getElementById('kpiLast');
+      const kTot  = document.getElementById('kpiTotal');
+      const kIPs  = document.getElementById('kpiIPs');
       const byEventEl = document.getElementById('byEvent');
-      const totalsEl = document.getElementById('totals');
-      const daysSel = document.getElementById('days');
+      const periodEl  = document.getElementById('period');
       let chart;
 
-      function setStatus(t){ statusEl.textContent = t || ""; }
+      function nb(x){ return new Intl.NumberFormat('fr-FR').format(x||0); }
+      function setStatus(t){ statusEl.textContent = t || "" }
 
       async function load(){
         setStatus("Chargement…");
         const days = daysSel.value;
-        try{
-          const r = await fetch('/stats?days=' + days, {cache:'no-store'});
+        try{{
+          // cache-busting explicite
+          const r = await fetch('/stats?days=' + days + '&_=' + Date.now(), {{ cache:'no-store' }});
           const data = await r.json();
 
-          // KPI 24h
-          const last = Number(data.last || 0);
-          kpiEl.textContent = new Intl.NumberFormat('fr-FR').format(last);
-          kpiSubEl.textContent = (data.by_day && data.by_day.length)
-              ? `Période : ${data.by_day[0].day} → ${data.by_day[data.by_day.length-1].day}`
-              : "";
+          // KPI
+          kLast.textContent = nb(data.last);
+          kTot.textContent  = nb(data.total);
+          kIPs.textContent  = nb(data.unique_ips);
 
-          // Courbe
-          const labels = (data.by_day || []).map(x => x.day);
-          const values = (data.by_day || []).map(x => x.n);
-          if(chart) chart.destroy();
-          chart = new Chart(document.getElementById('chart'), {
+          // période affichée
+          if ((data.by_day||[]).length){{
+            const a = data.by_day[0].day, b = data.by_day[data.by_day.length-1].day;
+            periodEl.textContent = `Période affichée : ${a} → ${b}`;
+          }} else {{
+            periodEl.textContent = "Aucune donnée sur la période.";
+          }}
+
+          // courbe
+          const labels = (data.by_day||[]).map(x => x.day);
+          const values = (data.by_day||[]).map(x => x.n);
+          if (chart) chart.destroy();
+          chart = new Chart(document.getElementById('chart'), {{
             type: 'line',
-            data: { labels, datasets: [{ label:'Événements', data: values, tension:.25 }] },
-            options: {
+            data: {{ labels, datasets:[{{ label:'Événements', data: values, tension:.25 }}] }},
+            options: {{
               responsive:true, maintainAspectRatio:false,
-              plugins:{ legend:{ display:false } },
-              scales:{ y:{ beginAtZero:true, ticks:{ precision:0 } } }
-            }
-          });
+              plugins:{{ legend:{{ display:false }} }},
+              scales:{{ y:{{ beginAtZero:true, ticks:{{ precision:0 }} }} }}
+            }}
+          }});
 
-          // Tableau stable
-          const rows = (data.by_event || []).map(x => {
-            const ev = String(x.event || '');
-            const n  = Number(x.n || 0);
-            return `<tr><td title="${ev}">${ev}</td><td>${new Intl.NumberFormat('fr-FR').format(n)}</td></tr>`;
-          }).join('');
-          byEventEl.innerHTML = rows || `<tr><td colspan="2" class="muted">Aucune donnée sur la période.</td></tr>`;
-
-          // Totaux période
-          const total = (data.by_event || []).reduce((s, x) => s + (Number(x.n)||0), 0);
-          totalsEl.textContent = `Total événements sur ${days} jours : ${new Intl.NumberFormat('fr-FR').format(total)}`;
+          // tableau
+          byEventEl.innerHTML = (data.by_event||[]).map(x => `
+            <tr><td title="\${x.event||''}">\${x.event||''}</td><td>\${nb(x.n)}</td></tr>
+          `).join('') || `<tr><td colspan="2" class="muted">Aucune donnée.</td></tr>`;
 
           setStatus("");
-        }catch(e){
+        }} catch(e) {{
           setStatus("Erreur de chargement");
-          byEventEl.innerHTML = `<tr><td colspan="2" style="color:#b91c1c">Impossible de charger les données.</td></tr>`;
-        }
+          console.error(e);
+          byEventEl.innerHTML = `<tr><td colspan="2" style="color:#fca5a5">Impossible de charger les données.</td></tr>`;
+        }}
       }
 
-      // changement de période = recharge instantanée
+      // recharge immédiate quand on change la période
       daysSel.addEventListener('change', load);
       document.getElementById('refresh').onclick = load;
 
+      // premier chargement
       load();
     </script>
     """
