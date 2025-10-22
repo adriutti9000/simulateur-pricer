@@ -1,4 +1,13 @@
 # app_pricer_cors.py
+# ---------------------------------------------------------
+# API FastAPI + tracking PostgreSQL (Neon) + dashboard /stats.html intégré
+# Dépendances (requirements.txt) :
+#   fastapi
+#   uvicorn[standard]
+#   pydantic>=2
+#   psycopg[binary,pool]==3.2.10
+# ---------------------------------------------------------
+
 import os, json, textwrap, time
 from typing import Any, Dict, Optional, Callable
 
@@ -18,7 +27,7 @@ from psycopg.errors import OperationalError, InterfaceError
 app = FastAPI(title="Simulateur Pricer API")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],            # limite à ton domaine Netlify si tu veux
+    allow_origins=["*"],            # si tu veux : mets ici ton domaine Netlify pour restreindre
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -31,7 +40,7 @@ _pool: Optional[ConnectionPool] = None
 def _build_pool() -> Optional[ConnectionPool]:
     if not DATABASE_URL:
         return None
-    # keepalives pour limiter les coupures
+    # keepalives pour limiter les coupures d'inactivité
     conninfo = (
         DATABASE_URL
         + ("&" if "?" in DATABASE_URL else "?")
@@ -73,7 +82,7 @@ def _get_pool() -> Optional[ConnectionPool]:
 def _with_db(action: Callable[[psycopg.Connection], Any]) -> Any:
     """
     Exécute une action DB avec retries si la connexion est fermée.
-    Ne passe PAS de paramètre 'pool' aux routes => pas d’erreur FastAPI.
+    (Pas de paramètre 'pool' dans les routes -> pas d'erreur FastAPI.)
     """
     global _pool
     for attempt in range(3):
@@ -84,7 +93,7 @@ def _with_db(action: Callable[[psycopg.Connection], Any]) -> Any:
             with pool.connection() as conn:
                 return action(conn)
         except (OperationalError, InterfaceError) as e:
-            # on reset le pool et on retente
+            # reset le pool et retente
             print("DB error, resetting pool:", e)
             try:
                 pool.close()
@@ -204,30 +213,49 @@ def stats(days: int = 30):
 
     return JSONResponse(out)
 
+# -------------------- Dashboard intégré /stats.html --------------------
 @app.get("/stats.html", include_in_schema=False)
 def stats_html():
     html = """
     <!doctype html><html lang="fr"><meta charset="utf-8">
     <title>Stats simulateur</title>
+    <meta name="viewport" content="width=device-width,initial-scale=1">
     <style>
-      body{font-family:Segoe UI,system-ui,Arial;margin:24px;background:#f5f7fb;color:#0f172a}
-      .wrap{max-width:980px;margin:auto}
-      h1{margin:0 0 10px}
-      .toolbar{display:flex;gap:10px;align-items:center;margin:10px 0 18px}
-      select,button,a{padding:8px 12px;border-radius:8px;border:1px solid #dbe3f3;font-size:14px;background:#fff;text-decoration:none;color:#0f172a}
-      button{background:#1d5fd3;color:#fff;border:none}
-      button:hover{background:#184fb0}
-      .grid{display:grid;grid-template-columns:1fr 2fr;gap:16px}
-      .card{background:#fff;border:1px solid #e6eaf2;border-radius:12px;padding:16px}
-      .kpi{font-size:28px;font-weight:800}
-      table{width:100%;border-collapse:collapse;margin-top:8px}
-      th,td{border-bottom:1px solid #eef2f7;padding:8px;text-align:left}
-      canvas{width:100%;height:260px}
+      :root{
+        --bg:#f6f8fb; --card:#fff; --text:#0f172a; --muted:#64748b; --border:#e6eaf2;
+        --primary:#1d5fd3; --primary-h:#184fb0;
+      }
+      *{box-sizing:border-box}
+      body{margin:0; font-family:system-ui, -apple-system, Segoe UI, Roboto, Arial; color:var(--text); background:var(--bg);}
+      .wrap{max-width:1080px; margin:24px auto; padding:0 16px;}
+      h1{margin:0 0 12px; font-size:22px}
+      .toolbar{display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin:6px 0 18px}
+      select,button,a{padding:8px 12px; border-radius:10px; border:1px solid var(--border); font-size:14px; background:#fff; color:var(--text); text-decoration:none}
+      button{background:var(--primary); color:#fff; border:none}
+      button:hover{background:var(--primary-h)}
+      .grid{display:grid; grid-template-columns:1fr 2fr; gap:16px}
+      @media (max-width:900px){ .grid{grid-template-columns:1fr} }
+      .card{background:var(--card); border:1px solid var(--border); border-radius:14px; padding:16px; box-shadow:0 4px 10px rgba(0,0,0,.04)}
+      .kpi{font-size:30px; font-weight:800}
+      .muted{color:var(--muted)}
+      /* ---- Chart ---- */
+      .chart-box{height:280px; position:relative}
+      .chart-box canvas{position:absolute; inset:0; width:100% !important; height:100% !important}
+      /* ---- Table stable ---- */
+      table{width:100%; border-collapse:collapse; table-layout:fixed}
+      th, td{padding:10px; border-bottom:1px solid var(--border); text-align:left; font-size:14px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis}
+      th{position:sticky; top:0; background:#fff; z-index:1}
+      .table-wrap{max-height:360px; overflow:auto; border:1px solid var(--border); border-radius:12px}
+      .cols-2{width:40%} .cols-1{width:60%}
+      /* ---- Footer / info ---- */
+      .info{margin-top:10px; font-size:13px; color:var(--muted)}
     </style>
+
     <div class="wrap">
       <h1>Statistiques d’usage</h1>
+
       <div class="toolbar">
-        <span>Période :</span>
+        <span class="muted">Période :</span>
         <select id="days">
           <option value="7">7 jours</option>
           <option value="30" selected>30 jours</option>
@@ -235,52 +263,97 @@ def stats_html():
         </select>
         <button id="refresh">Actualiser</button>
         <a href="/events.csv" target="_blank">Télécharger le CSV</a>
+        <span id="status" class="muted" style="margin-left:auto"></span>
       </div>
 
       <div class="grid">
         <div class="card">
-          <div>Événements sur 24h</div>
+          <div class="muted">Événements sur 24h</div>
           <div id="kpi" class="kpi">–</div>
+          <div id="kpi-sub" class="info"></div>
         </div>
+
         <div class="card">
-          <div>Événements par jour</div>
-          <canvas id="chart"></canvas>
+          <div class="muted" style="margin-bottom:8px">Événements par jour</div>
+          <div class="chart-box"><canvas id="chart"></canvas></div>
         </div>
       </div>
 
       <div class="card" style="margin-top:16px">
-        <div>Par type d’événement</div>
-        <table>
-          <thead><tr><th>Événement</th><th>Compteur</th></tr></thead>
-          <tbody id="byEvent"></tbody>
-        </table>
+        <div class="muted" style="margin-bottom:8px">Par type d’événement</div>
+
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th class="cols-1">Événement</th><th class="cols-2">Compteur</th></tr>
+            </thead>
+            <tbody id="byEvent"></tbody>
+          </table>
+        </div>
+
+        <div id="totals" class="info"></div>
       </div>
     </div>
 
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <script>
-      const ctx = document.getElementById('chart').getContext('2d');
+      const statusEl = document.getElementById('status');
+      const kpiEl = document.getElementById('kpi');
+      const kpiSubEl = document.getElementById('kpi-sub');
+      const byEventEl = document.getElementById('byEvent');
+      const totalsEl = document.getElementById('totals');
+      const daysSel = document.getElementById('days');
       let chart;
+
+      function setStatus(t){ statusEl.textContent = t || ""; }
+
       async function load(){
-        const days = document.getElementById('days').value;
-        const r = await fetch('/stats?days=' + days);
-        const data = await r.json();
+        setStatus("Chargement…");
+        const days = daysSel.value;
+        try{
+          const r = await fetch('/stats?days=' + days, {cache:'no-store'});
+          const data = await r.json();
 
-        document.getElementById('kpi').textContent = data.last ?? 0;
+          // KPI 24h
+          const last = Number(data.last || 0);
+          kpiEl.textContent = new Intl.NumberFormat('fr-FR').format(last);
+          kpiSubEl.textContent = (data.by_day && data.by_day.length)
+              ? `Période affichée : ${data.by_day[0].day} → ${data.by_day[data.by_day.length-1].day}`
+              : "";
 
-        const labels = (data.by_day||[]).map(x => x.day);
-        const values = (data.by_day||[]).map(x => x.n);
+          // Courbe
+          const labels = (data.by_day || []).map(x => x.day);
+          const values = (data.by_day || []).map(x => x.n);
+          if(chart) chart.destroy();
+          chart = new Chart(document.getElementById('chart'), {
+            type: 'line',
+            data: { labels, datasets: [{ label:'Événements', data: values, tension: .25 }] },
+            options: {
+              responsive:true, maintainAspectRatio:false,
+              plugins:{ legend:{ display:false } },
+              scales:{ y:{ beginAtZero:true, ticks:{ precision:0 } } }
+            }
+          });
 
-        if (chart) chart.destroy();
-        chart = new Chart(ctx, {
-          type: 'line',
-          data: { labels, datasets:[{ label:'Événements', data: values }] },
-          options: { responsive:true, maintainAspectRatio:false, scales:{ y:{ beginAtZero:true, ticks:{ precision:0 } } } }
-        });
+          // Tableau : tailles stables + scroll interne
+          const rows = (data.by_event || []).map(x => {
+            const ev = String(x.event || '');
+            const n  = Number(x.n || 0);
+            return `<tr><td title="${ev}">${ev}</td><td>${new Intl.NumberFormat('fr-FR').format(n)}</td></tr>`;
+          }).join('');
+          byEventEl.innerHTML = rows || `<tr><td colspan="2" class="muted">Aucune donnée sur la période.</td></tr>`;
 
-        document.getElementById('byEvent').innerHTML =
-          (data.by_event||[]).map(x => `<tr><td>${x.event}</td><td>${x.n}</td></tr>`).join('');
+          // Totaux
+          const total = (data.by_event || []).reduce((s, x) => s + (Number(x.n)||0), 0);
+          totalsEl.textContent = `Total événements sur ${days} jours : ${new Intl.NumberFormat('fr-FR').format(total)}`;
+
+          setStatus("");
+        }catch(e){
+          setStatus("Erreur de chargement");
+          byEventEl.innerHTML = `<tr><td colspan="2" style="color:#b91c1c">Impossible de charger les données.</td></tr>`;
+        }
       }
+
       document.getElementById('refresh').onclick = load;
       load();
     </script>

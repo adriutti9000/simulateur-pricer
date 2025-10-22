@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8" />
+  <title>Statistiques du simulateur</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <style>
+    body {
+      font-family: "Inter", Arial, sans-serif;
+      margin: 0;
+      padding: 30px;
+      background-color: #f6f8fa;
+      color: #222;
+    }
+
+    h1 {
+      text-align: center;
+      font-size: 1.8rem;
+      margin-bottom: 15px;
+    }
+
+    .toolbar {
+      text-align: center;
+      margin-bottom: 25px;
+    }
+
+    button, select, a.download-btn {
+      background-color: #004aad;
+      color: white;
+      border: none;
+      border-radius: 8px;
+      padding: 8px 14px;
+      margin: 5px;
+      font-size: 0.95rem;
+      cursor: pointer;
+      text-decoration: none;
+      display: inline-block;
+    }
+
+    button:hover, a.download-btn:hover {
+      background-color: #0060d1;
+    }
+
+    .stats-grid {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: center;
+      gap: 15px;
+      margin-bottom: 30px;
+    }
+
+    .stat-box {
+      background: white;
+      padding: 15px 20px;
+      border-radius: 10px;
+      box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+      min-width: 180px;
+      text-align: center;
+    }
+
+    .stat-box h3 {
+      margin: 0;
+      font-size: 1.1rem;
+      color: #004aad;
+    }
+
+    .stat-box p {
+      margin: 5px 0 0 0;
+      font-size: 1.4rem;
+      font-weight: bold;
+    }
+
+    canvas {
+      width: 100%;
+      max-width: 900px;
+      height: 300px;
+      margin: 0 auto;
+      display: block;
+    }
+
+    table {
+      border-collapse: collapse;
+      width: 100%;
+      margin-top: 25px;
+      background: white;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+    }
+
+    th, td {
+      border: 1px solid #ddd;
+      padding: 10px;
+      text-align: center;
+    }
+
+    th {
+      background-color: #004aad;
+      color: white;
+    }
+
+    tr:nth-child(even) {
+      background-color: #f9f9f9;
+    }
+
+    footer {
+      margin-top: 30px;
+      text-align: center;
+      font-size: 0.85rem;
+      color: #555;
+    }
+  </style>
+</head>
+<body>
+  <h1>Statistiques du simulateur</h1>
+
+  <div class="toolbar">
+    <label for="days">Période :</label>
+    <select id="days">
+      <option value="7">7 jours</option>
+      <option value="30" selected>30 jours</option>
+      <option value="90">90 jours</option>
+    </select>
+
+    <button onclick="refreshStats()">Mettre à jour</button>
+    <a class="download-btn" href="/events.csv" download>Télécharger le CSV</a>
+  </div>
+
+  <div class="stats-grid">
+    <div class="stat-box">
+      <h3>Pages vues</h3>
+      <p id="pageviews">–</p>
+    </div>
+    <div class="stat-box">
+      <h3>Simulations lancées</h3>
+      <p id="clicks">–</p>
+    </div>
+    <div class="stat-box">
+      <h3>Calculs réussis</h3>
+      <p id="success">–</p>
+    </div>
+    <div class="stat-box">
+      <h3>Erreurs</h3>
+      <p id="errors">–</p>
+    </div>
+  </div>
+
+  <canvas id="chart"></canvas>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Date</th>
+        <th>Pages vues</th>
+        <th>Simulations</th>
+        <th>Réussites</th>
+        <th>Erreurs</th>
+      </tr>
+    </thead>
+    <tbody id="table-body"></tbody>
+  </table>
+
+  <footer>
+    Données en temps réel – Spirit Asset Management © 2025
+  </footer>
+
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <script>
+    async function refreshStats() {
+      const days = document.getElementById("days").value;
+      const res = await fetch(`/stats?days=${days}`);
+      const data = await res.json();
+
+      document.getElementById("pageviews").innerText = data.pageviews;
+      document.getElementById("clicks").innerText = data.clicks;
+      document.getElementById("success").innerText = data.success;
+      document.getElementById("errors").innerText = data.errors;
+
+      const tbody = document.getElementById("table-body");
+      tbody.innerHTML = "";
+      data.daily.forEach(d => {
+        const row = `<tr>
+          <td>${d.date}</td>
+          <td>${d.pageviews}</td>
+          <td>${d.clicks}</td>
+          <td>${d.success}</td>
+          <td>${d.errors}</td>
+        </tr>`;
+        tbody.insertAdjacentHTML("beforeend", row);
+      });
+
+      updateChart(data.daily);
+    }
+
+    let chart;
+    function updateChart(daily) {
+      const ctx = document.getElementById("chart");
+      const labels = daily.map(d => d.date);
+      const views = daily.map(d => d.pageviews);
+      const clicks = daily.map(d => d.clicks);
+      const success = daily.map(d => d.success);
+
+      if (chart) chart.destroy();
+      chart = new Chart(ctx, {
+        type: 'line',
+        data: {
+          labels,
+          datasets: [
+            { label: 'Pages vues', data: views, borderColor: '#004aad', tension: 0.3 },
+            { label: 'Simulations', data: clicks, borderColor: '#ff9f00', tension: 0.3 },
+            { label: 'Réussites', data: success, borderColor: '#4caf50', tension: 0.3 }
+          ]
+        },
+        options: {
+          responsive: true,
+          plugins: {
+            legend: { position: 'bottom' }
+          },
+          scales: {
+            x: { grid: { display: false } },
+            y: { beginAtZero: true }
+          }
+        }
+      });
+    }
+
+    refreshStats();
+  </script>
+</body>
+</html>
