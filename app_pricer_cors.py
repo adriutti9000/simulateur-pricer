@@ -27,7 +27,7 @@ from psycopg.errors import OperationalError, InterfaceError
 app = FastAPI(title="Simulateur Pricer API")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],            # limite à ton domaine Netlify si tu veux
+    allow_origins=["*"],            # si besoin, remplace par ton domaine Netlify
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -53,6 +53,29 @@ def _build_pool() -> Optional[ConnectionPool]:
         timeout=30,
     )
 
+def _ensure_schema(conn: psycopg.Connection) -> None:
+    """Crée la table si besoin et ajoute les colonnes manquantes (migrations douces)."""
+    # Table minimale (certaines anciennes versions n’avaient pas ref/payload)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS events(
+            id BIGSERIAL PRIMARY KEY,
+            ts_utc TIMESTAMPTZ NOT NULL DEFAULT (NOW() AT TIME ZONE 'UTC'),
+            ip  TEXT,
+            ua  TEXT,
+            event   TEXT NOT NULL,
+            payload JSONB
+        );
+    """)
+    # Ajoute les colonnes manquantes
+    conn.execute("ALTER TABLE events ADD COLUMN IF NOT EXISTS ref TEXT;")
+    conn.execute("ALTER TABLE events ADD COLUMN IF NOT EXISTS payload JSONB;")
+    conn.execute("ALTER TABLE events ADD COLUMN IF NOT EXISTS ua TEXT;")
+    conn.execute("ALTER TABLE events ADD COLUMN IF NOT EXISTS ip TEXT;")
+    conn.execute("""
+        ALTER TABLE events
+        ALTER COLUMN ts_utc SET DEFAULT (NOW() AT TIME ZONE 'UTC');
+    """)
+
 def _get_pool() -> Optional[ConnectionPool]:
     """Retourne un pool prêt. Recrée si besoin et initialise la table/colonnes."""
     global _pool
@@ -61,18 +84,7 @@ def _get_pool() -> Optional[ConnectionPool]:
             _pool = _build_pool()
             if _pool:
                 with _pool.connection() as conn:
-                    conn.execute("""
-                        CREATE TABLE IF NOT EXISTS events(
-                            id BIGSERIAL PRIMARY KEY,
-                            ts_utc TIMESTAMPTZ NOT NULL DEFAULT (NOW() AT TIME ZONE 'UTC'),
-                            ip  TEXT,
-                            ua  TEXT,
-                            event   TEXT NOT NULL,
-                            payload JSONB
-                        );
-                    """)
-                    # migration douce
-                    conn.execute("ALTER TABLE events ADD COLUMN IF NOT EXISTS ref TEXT;")
+                    _ensure_schema(conn)
                 print("Postgres: CONNECTED & TABLE READY (migrée)")
         except Exception as e:
             print("Postgres: INIT ERROR", e)
@@ -111,6 +123,11 @@ class ComputeIn(BaseModel):
     frais_contrat: float = 0.0  # décimal (ex: 0.001 = 0,10 %)
 
 # -------------------- Routes --------------------
+@app.get("/health", include_in_schema=False)
+def health():
+    ok = _with_db(lambda c: 1) is not None
+    return JSONResponse({"ok": True, "db": ok})
+
 @app.get("/", include_in_schema=False)
 def root():
     return JSONResponse({"ok": True, "docs": "/docs"})
@@ -353,7 +370,7 @@ def stats_html():
         }
       }
 
-      // change de période = recharge immédiate
+      // changement de période = recharge instantanée
       daysSel.addEventListener('change', load);
       document.getElementById('refresh').onclick = load;
 
