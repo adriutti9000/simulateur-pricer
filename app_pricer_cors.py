@@ -40,7 +40,6 @@ _pool: Optional[ConnectionPool] = None
 def _build_pool() -> Optional[ConnectionPool]:
     if not DATABASE_URL:
         return None
-    # keepalives pour limiter les coupures d'inactivité
     conninfo = (
         DATABASE_URL
         + ("&" if "?" in DATABASE_URL else "?")
@@ -62,7 +61,6 @@ def _get_pool() -> Optional[ConnectionPool]:
             _pool = _build_pool()
             if _pool:
                 with _pool.connection() as conn:
-                    # Table minimale
                     conn.execute("""
                         CREATE TABLE IF NOT EXISTS events(
                             id BIGSERIAL PRIMARY KEY,
@@ -73,7 +71,7 @@ def _get_pool() -> Optional[ConnectionPool]:
                             payload JSONB
                         );
                     """)
-                    # 🔧 Migrations "douces" : on ajoute la colonne ref si elle n'existe pas
+                    # migration douce
                     conn.execute("ALTER TABLE events ADD COLUMN IF NOT EXISTS ref TEXT;")
                 print("Postgres: CONNECTED & TABLE READY (migrée)")
         except Exception as e:
@@ -82,10 +80,7 @@ def _get_pool() -> Optional[ConnectionPool]:
     return _pool
 
 def _with_db(action: Callable[[psycopg.Connection], Any]) -> Any:
-    """
-    Exécute une action DB avec retries si la connexion est fermée.
-    (Pas de paramètre 'pool' dans les routes -> pas d'erreur FastAPI.)
-    """
+    """Exécute une action DB avec retries si la connexion est fermée (Neon idle)."""
     global _pool
     for attempt in range(3):
         pool = _get_pool()
@@ -95,7 +90,6 @@ def _with_db(action: Callable[[psycopg.Connection], Any]) -> Any:
             with pool.connection() as conn:
                 return action(conn)
         except (OperationalError, InterfaceError) as e:
-            # reset le pool et retente
             print("DB error, resetting pool:", e)
             try:
                 pool.close()
@@ -213,15 +207,16 @@ def stats(days: int = 30):
         out["last"] = int(last)
         out["by_event"] = [{"event": r["event"], "n": int(r["n"])} for r in by_event]
 
-    return JSONResponse(out)
+    return JSONResponse(out, headers={"Cache-Control": "no-store"})
 
-# -------------------- Dashboard intégré /stats.html (design propre) --------------------
+# -------------------- Dashboard intégré /stats.html (design ++, change période OK) --------------------
 @app.get("/stats.html", include_in_schema=False)
 def stats_html():
     html = """
     <!doctype html><html lang="fr"><meta charset="utf-8">
     <title>Stats simulateur</title>
     <meta name="viewport" content="width=device-width,initial-scale=1">
+    <meta http-equiv="Cache-Control" content="no-store" />
     <style>
       :root{
         --bg:#f6f8fb; --card:#fff; --text:#0f172a; --muted:#64748b; --border:#e6eaf2;
@@ -250,7 +245,6 @@ def stats_html():
       th{position:sticky; top:0; background:#fff; z-index:1}
       .table-wrap{max-height:420px; overflow:auto; border:1px solid var(--border); border-radius:12px}
       .cols-2{width:40%} .cols-1{width:60%}
-      /* ---- Badges ---- */
       .badge{display:inline-block; padding:4px 8px; border-radius:999px; background:#eef4ff; color:#1d5fd3; font-size:12px; margin-left:8px}
       .info{margin-top:10px; font-size:13px; color:var(--muted)}
       .status{margin-left:auto; font-size:13px; color:var(--muted)}
@@ -359,11 +353,14 @@ def stats_html():
         }
       }
 
+      // change de période = recharge immédiate
+      daysSel.addEventListener('change', load);
       document.getElementById('refresh').onclick = load;
+
       load();
     </script>
     """
-    return HTMLResponse(textwrap.dedent(html))
+    return HTMLResponse(textwrap.dedent(html), headers={"Cache-Control": "no-store"})
 
 # -------------------- Startup --------------------
 @app.on_event("startup")
