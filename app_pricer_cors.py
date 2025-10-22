@@ -27,7 +27,7 @@ from psycopg.errors import OperationalError, InterfaceError
 app = FastAPI(title="Simulateur Pricer API")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],            # si tu veux : mets ici ton domaine Netlify pour restreindre
+    allow_origins=["*"],            # limite à ton domaine Netlify si tu veux
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -55,25 +55,27 @@ def _build_pool() -> Optional[ConnectionPool]:
     )
 
 def _get_pool() -> Optional[ConnectionPool]:
-    """Retourne un pool prêt. Recrée si besoin et initialise la table."""
+    """Retourne un pool prêt. Recrée si besoin et initialise la table/colonnes."""
     global _pool
     if _pool is None:
         try:
             _pool = _build_pool()
             if _pool:
                 with _pool.connection() as conn:
+                    # Table minimale
                     conn.execute("""
                         CREATE TABLE IF NOT EXISTS events(
                             id BIGSERIAL PRIMARY KEY,
                             ts_utc TIMESTAMPTZ NOT NULL DEFAULT (NOW() AT TIME ZONE 'UTC'),
                             ip  TEXT,
                             ua  TEXT,
-                            ref TEXT,
                             event   TEXT NOT NULL,
                             payload JSONB
                         );
                     """)
-                print("Postgres: CONNECTED & TABLE READY")
+                    # 🔧 Migrations "douces" : on ajoute la colonne ref si elle n'existe pas
+                    conn.execute("ALTER TABLE events ADD COLUMN IF NOT EXISTS ref TEXT;")
+                print("Postgres: CONNECTED & TABLE READY (migrée)")
         except Exception as e:
             print("Postgres: INIT ERROR", e)
             _pool = None
@@ -162,7 +164,7 @@ async def collect(request: Request):
 def events_csv():
     def _load(conn: psycopg.Connection):
         return conn.execute(
-            "SELECT id, ts_utc, ip, event, payload FROM events ORDER BY id DESC LIMIT 2000"
+            "SELECT id, ts_utc, ip, event, payload FROM events ORDER BY id DESC LIMIT 5000"
         ).fetchall()
 
     rows = _with_db(_load) or []
@@ -213,7 +215,7 @@ def stats(days: int = 30):
 
     return JSONResponse(out)
 
-# -------------------- Dashboard intégré /stats.html --------------------
+# -------------------- Dashboard intégré /stats.html (design propre) --------------------
 @app.get("/stats.html", include_in_schema=False)
 def stats_html():
     html = """
@@ -227,32 +229,38 @@ def stats_html():
       }
       *{box-sizing:border-box}
       body{margin:0; font-family:system-ui, -apple-system, Segoe UI, Roboto, Arial; color:var(--text); background:var(--bg);}
-      .wrap{max-width:1080px; margin:24px auto; padding:0 16px;}
-      h1{margin:0 0 12px; font-size:22px}
-      .toolbar{display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin:6px 0 18px}
+      .wrap{max-width:1100px; margin:28px auto; padding:0 16px;}
+      header{display:flex; justify-content:space-between; align-items:center; margin-bottom:14px}
+      h1{margin:0; font-size:22px}
+      .toolbar{display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin:10px 0 18px}
       select,button,a{padding:8px 12px; border-radius:10px; border:1px solid var(--border); font-size:14px; background:#fff; color:var(--text); text-decoration:none}
       button{background:var(--primary); color:#fff; border:none}
       button:hover{background:var(--primary-h)}
       .grid{display:grid; grid-template-columns:1fr 2fr; gap:16px}
       @media (max-width:900px){ .grid{grid-template-columns:1fr} }
       .card{background:var(--card); border:1px solid var(--border); border-radius:14px; padding:16px; box-shadow:0 4px 10px rgba(0,0,0,.04)}
-      .kpi{font-size:30px; font-weight:800}
+      .kpi{font-size:34px; font-weight:800}
       .muted{color:var(--muted)}
       /* ---- Chart ---- */
-      .chart-box{height:280px; position:relative}
+      .chart-box{height:320px; position:relative}
       .chart-box canvas{position:absolute; inset:0; width:100% !important; height:100% !important}
       /* ---- Table stable ---- */
       table{width:100%; border-collapse:collapse; table-layout:fixed}
       th, td{padding:10px; border-bottom:1px solid var(--border); text-align:left; font-size:14px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis}
       th{position:sticky; top:0; background:#fff; z-index:1}
-      .table-wrap{max-height:360px; overflow:auto; border:1px solid var(--border); border-radius:12px}
+      .table-wrap{max-height:420px; overflow:auto; border:1px solid var(--border); border-radius:12px}
       .cols-2{width:40%} .cols-1{width:60%}
-      /* ---- Footer / info ---- */
+      /* ---- Badges ---- */
+      .badge{display:inline-block; padding:4px 8px; border-radius:999px; background:#eef4ff; color:#1d5fd3; font-size:12px; margin-left:8px}
       .info{margin-top:10px; font-size:13px; color:var(--muted)}
+      .status{margin-left:auto; font-size:13px; color:var(--muted)}
     </style>
 
     <div class="wrap">
-      <h1>Statistiques d’usage</h1>
+      <header>
+        <h1>Statistiques d’usage <span class="badge">Live</span></h1>
+        <a href="/events.csv" target="_blank">Télécharger le CSV</a>
+      </header>
 
       <div class="toolbar">
         <span class="muted">Période :</span>
@@ -262,8 +270,7 @@ def stats_html():
           <option value="90">90 jours</option>
         </select>
         <button id="refresh">Actualiser</button>
-        <a href="/events.csv" target="_blank">Télécharger le CSV</a>
-        <span id="status" class="muted" style="margin-left:auto"></span>
+        <span id="status" class="status"></span>
       </div>
 
       <div class="grid">
@@ -281,7 +288,6 @@ def stats_html():
 
       <div class="card" style="margin-top:16px">
         <div class="muted" style="margin-bottom:8px">Par type d’événement</div>
-
         <div class="table-wrap">
           <table>
             <thead>
@@ -290,7 +296,6 @@ def stats_html():
             <tbody id="byEvent"></tbody>
           </table>
         </div>
-
         <div id="totals" class="info"></div>
       </div>
     </div>
@@ -318,7 +323,7 @@ def stats_html():
           const last = Number(data.last || 0);
           kpiEl.textContent = new Intl.NumberFormat('fr-FR').format(last);
           kpiSubEl.textContent = (data.by_day && data.by_day.length)
-              ? `Période affichée : ${data.by_day[0].day} → ${data.by_day[data.by_day.length-1].day}`
+              ? `Période : ${data.by_day[0].day} → ${data.by_day[data.by_day.length-1].day}`
               : "";
 
           // Courbe
@@ -327,7 +332,7 @@ def stats_html():
           if(chart) chart.destroy();
           chart = new Chart(document.getElementById('chart'), {
             type: 'line',
-            data: { labels, datasets: [{ label:'Événements', data: values, tension: .25 }] },
+            data: { labels, datasets: [{ label:'Événements', data: values, tension:.25 }] },
             options: {
               responsive:true, maintainAspectRatio:false,
               plugins:{ legend:{ display:false } },
@@ -335,7 +340,7 @@ def stats_html():
             }
           });
 
-          // Tableau : tailles stables + scroll interne
+          // Tableau stable
           const rows = (data.by_event || []).map(x => {
             const ev = String(x.event || '');
             const n  = Number(x.n || 0);
@@ -343,7 +348,7 @@ def stats_html():
           }).join('');
           byEventEl.innerHTML = rows || `<tr><td colspan="2" class="muted">Aucune donnée sur la période.</td></tr>`;
 
-          // Totaux
+          // Totaux période
           const total = (data.by_event || []).reduce((s, x) => s + (Number(x.n)||0), 0);
           totalsEl.textContent = `Total événements sur ${days} jours : ${new Intl.NumberFormat('fr-FR').format(total)}`;
 
