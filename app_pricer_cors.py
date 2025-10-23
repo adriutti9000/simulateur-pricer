@@ -1,11 +1,6 @@
 # -*- coding: utf-8 -*-
 # app_pricer_cors.py
-# API FastAPI + tracking PostgreSQL (Neon) + dashboard /stats.html intégré
-# Dépendances (requirements.txt) :
-#   fastapi
-#   uvicorn[standard]
-#   pydantic>=2
-#   psycopg[binary,pool]==3.2.10
+# API FastAPI + tracking PostgreSQL (Neon) + dashboard /stats.html
 
 import os, json, time, textwrap
 from typing import Any, Optional, Callable
@@ -22,17 +17,17 @@ from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
 from psycopg.errors import OperationalError, InterfaceError
 
-# -------------- CORS --------------
+# -------------------- CORS --------------------
 app = FastAPI(title="Simulateur Pricer API")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # restreins ici à ton domaine Netlify si tu veux
+    allow_origins=["*"],  # restreins à ton domaine Netlify si tu veux
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# -------------- DB pool (Neon) --------------
+# -------------------- DB pool (Neon) --------------------
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 _pool: Optional[ConnectionPool] = None
 
@@ -48,24 +43,22 @@ def _build_pool() -> Optional[ConnectionPool]:
     return ConnectionPool(
         conninfo=conninfo,
         min_size=1,
-        max_size=5,
-        kwargs={"autocommit": True, "row_factory": dict_row},
-        timeout=30,
+        max_size=3,
+        kwargs={"autocommit": True, "prepare_threshold": 0},
     )
 
 def _ensure_schema(conn: psycopg.Connection) -> None:
-    # table minimale
     conn.execute("""
         CREATE TABLE IF NOT EXISTS events(
             id BIGSERIAL PRIMARY KEY,
             ts_utc TIMESTAMPTZ NOT NULL DEFAULT (NOW() AT TIME ZONE 'UTC'),
             ip  TEXT,
             ua  TEXT,
+            ref TEXT,
             event   TEXT NOT NULL,
             payload JSONB
         );
     """)
-    # migrations douces
     conn.execute("ALTER TABLE events ADD COLUMN IF NOT EXISTS ref TEXT;")
     conn.execute("ALTER TABLE events ADD COLUMN IF NOT EXISTS payload JSONB;")
     conn.execute("ALTER TABLE events ADD COLUMN IF NOT EXISTS ua TEXT;")
@@ -83,7 +76,7 @@ def _get_pool() -> Optional[ConnectionPool]:
             if _pool:
                 with _pool.connection() as conn:
                     _ensure_schema(conn)
-                print("Postgres: CONNECTED & TABLE READY (migrée)")
+                print("Postgres: CONNECTED & TABLE READY")
         except Exception as e:
             print("Postgres: INIT ERROR", e)
             _pool = None
@@ -93,34 +86,26 @@ def _with_db(action: Callable[[psycopg.Connection], Any]) -> Any:
     """Exécute une action DB avec retries si Neon coupe la connexion idle."""
     global _pool
     for attempt in range(3):
-        pool = _get_pool()
-        if not pool:
-            return None
         try:
+            pool = _get_pool()
+            if not pool:
+                return None
             with pool.connection() as conn:
                 return action(conn)
         except (OperationalError, InterfaceError) as e:
-            print("DB error, resetting pool:", e)
-            try:
-                pool.close()
-            except Exception:
-                pass
-            _pool = None
-            time.sleep(0.25 * (attempt + 1))
-        except Exception as e:
-            print("DB action error:", e)
-            return None
+            print("DB retry", attempt+1, e)
+            time.sleep(0.4 * (attempt + 1))
     return None
 
-# -------------- Schéma /compute --------------
+# -------------------- Schéma I/O --------------------
 class ComputeIn(BaseModel):
     montant_disponible: float
     devise: str
     duree: int
-    retrocessions: str     # "oui" / "non"
-    frais_contrat: float = 0.0  # 0.001 = 0,10 %
+    retrocessions: str           # "oui" / "non"
+    frais_contrat: float = 0.0   # 0.001 = 0,10 %
 
-# -------------- Routes coeur --------------
+# -------------------- Routes coeur --------------------
 @app.get("/health", include_in_schema=False)
 def health():
     ok = _with_db(lambda c: 1) is not None
@@ -134,13 +119,13 @@ def root():
 def compute(inp: ComputeIn):
     include_retro = (inp.retrocessions.lower() == "oui")
     out = compute_annuity(
-        amount=inp.montant_disponible,
+        amount=float(inp.montant_disponible),
         currency=inp.devise,
-        years=inp.duree,
+        years=int(inp.duree),
         include_retro=include_retro,
-        extra_contract_fee=inp.frais_contrat or 0.0,
+        extra_contract_fee=float(inp.frais_contrat),
     )
-    return out
+    return JSONResponse(out)
 
 def _client_ip(request: Request) -> str:
     for h in ("x-forwarded-for", "cf-connecting-ip", "x-real-ip"):
@@ -158,25 +143,22 @@ async def collect(request: Request):
     event = str(body.get("event") or "event")
     ip = _client_ip(request)
     ua = request.headers.get("user-agent", "")
-    ref = request.headers.get("referer", "")
-
+    ref = request.headers.get("referer", "") or request.query_params.get("ref") or ""
     def _insert(conn: psycopg.Connection):
         conn.execute(
             "INSERT INTO events (ip, ua, ref, event, payload) VALUES (%s, %s, %s, %s, %s)",
             (ip, ua, ref, event, json.dumps(body)),
         )
-
     _with_db(_insert)
     return {"ok": True}
 
-# -------------- Exports & stats API --------------
+# -------------------- Exports & stats API --------------------
 @app.get("/events.csv")
 def events_csv():
     def _load(conn: psycopg.Connection):
         return conn.execute(
             "SELECT id, ts_utc, ip, event, payload FROM events ORDER BY id DESC LIMIT 5000"
         ).fetchall()
-
     rows = _with_db(_load) or []
     lines = ["id;ts_utc;ip;event;payload"]
     for r in rows:
@@ -193,124 +175,111 @@ def stats(days: int = 30):
     def _query(conn: psycopg.Connection):
         by_day = conn.execute(
             """
-            SELECT date_trunc('day', ts_utc) AS day, COUNT(*) AS n
+            SELECT to_char(date_trunc('day', ts_utc), 'YYYY-MM-DD') AS day, COUNT(*) AS n
             FROM events
-            WHERE ts_utc >= (NOW() AT TIME ZONE 'UTC') - make_interval(days => %s)
-            GROUP BY 1
-            ORDER BY 1;
+            WHERE ts_utc >= NOW() AT TIME ZONE 'UTC' - INTERVAL %s
+            GROUP BY 1 ORDER BY 1
             """,
-            (days,),
+            (f"{days} days",),
         ).fetchall()
-        last = conn.execute(
-            "SELECT COUNT(*) AS n FROM events WHERE ts_utc >= (NOW() AT TIME ZONE 'UTC') - interval '24 hours';"
-        ).fetchone()["n"]
+
         by_event = conn.execute(
             """
             SELECT event, COUNT(*) AS n
             FROM events
-            WHERE ts_utc >= (NOW() AT TIME ZONE 'UTC') - make_interval(days => %s)
-            GROUP BY 1
-            ORDER BY n DESC, event ASC;
+            WHERE ts_utc >= NOW() AT TIME ZONE 'UTC' - INTERVAL %s
+            GROUP BY 1 ORDER BY 2 DESC, 1 ASC
             """,
-            (days,),
+            (f"{days} days",),
         ).fetchall()
+
+        last24 = conn.execute(
+            "SELECT COUNT(*) FROM events WHERE ts_utc >= NOW() AT TIME ZONE 'UTC' - INTERVAL '24 hours'"
+        ).fetchone()[0]
+
         total = conn.execute(
-            "SELECT COUNT(*) AS n FROM events WHERE ts_utc >= (NOW() AT TIME ZONE 'UTC') - make_interval(days => %s);",
-            (days,),
-        ).fetchone()["n"]
+            "SELECT COUNT(*) FROM events WHERE ts_utc >= NOW() AT TIME ZONE 'UTC' - INTERVAL %s",
+            (f"{days} days",),
+        ).fetchone()[0]
+
         unique_ips = conn.execute(
-            "SELECT COUNT(DISTINCT ip) AS n FROM events WHERE ts_utc >= (NOW() AT TIME ZONE 'UTC') - make_interval(days => %s);",
-            (days,),
-        ).fetchone()["n"]
-        return by_day, last, by_event, total, unique_ips
+            "SELECT COUNT(DISTINCT ip) FROM events WHERE ts_utc >= NOW() AT TIME ZONE 'UTC' - INTERVAL %s",
+            (f"{days} days",),
+        ).fetchone()[0]
 
-    res = _with_db(_query)
-    if res:
-        by_day, last, by_event, total, unique_ips = res
-        out["by_day"] = [{"day": str(r["day"])[:10], "n": int(r["n"])} for r in by_day]
-        out["last"] = int(last)
-        out["by_event"] = [{"event": r["event"], "n": int(r["n"])} for r in by_event]
-        out["total"] = int(total)
-        out["unique_ips"] = int(unique_ips)
+        return by_day, by_event, last24, total, unique_ips
 
-    return JSONResponse(out, headers={"Cache-Control": "no-store"})
+    rows_day, rows_event, last24, total, uips = _with_db(_query) or ([], [], 0, 0, 0)
+    out["by_day"] = [{"day": r["day"], "n": int(r["n"])} for r in rows_day]
+    out["by_event"] = [{"event": r["event"], "n": int(r["n"])} for r in rows_event]
+    out["last"] = int(last24 or 0)
+    out["total"] = int(total or 0)
+    out["unique_ips"] = int(uips or 0)
+    return JSONResponse(out)
 
-# -------------- Dashboard /stats.html (sans f-string) --------------
+# -------------------- Nouveau dashboard /stats.html --------------------
 @app.get("/stats.html", include_in_schema=False)
 def stats_html():
     html = """
 <!doctype html><html lang="fr"><meta charset="utf-8">
-<title>Stats simulateur v3.2</title>
+<title>Statistiques d’usage — simulateur</title>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta http-equiv="Cache-Control" content="no-store" />
 <style>
   :root{
-    --bg:#0b1220; --bg2:#0f172a; --card:#0f1b31; --edge:#213655; --text:#e6eefc; --muted:#94a3b8;
-    --brand:#1d5fd3;
+    color-scheme: light dark;
+    --bg:#0b1220; --bg2:#0f172a; --card:#0f1b31; --edge:#213655; --text:#e6eefc; --muted:#94a3b8; --brand:#1d5fd3;
+  }
+  @media (prefers-color-scheme: light){
+    :root{ --bg:#f6f8fc; --bg2:#eef2f8; --card:#ffffff; --edge:#d6e0ee; --text:#0f172a; --muted:#67758a; --brand:#1d5fd3; }
   }
   *{box-sizing:border-box}
-  body{margin:0; font-family:Inter, system-ui, -apple-system, Segoe UI, Roboto, Arial; color:var(--text); background:linear-gradient(180deg,var(--bg), var(--bg2));}
-  .wrap{max-width:1150px; margin:28px auto; padding:0 18px;}
-  header.banner{background:linear-gradient(90deg,#1d5fd3, #0ea5e9); border-radius:14px; padding:16px 18px; box-shadow:0 10px 30px rgba(0,0,0,.25);}
-  header .title{display:flex; align-items:baseline; gap:10px;}
-  header h1{margin:0; font-size:20px; font-weight:800; color:#fff}
-  header .ver{opacity:.85; color:#e2efff; font-size:12px; padding:2px 8px; border-radius:999px; background:rgba(255,255,255,.15)}
-  .toolbar{display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin:14px 0 18px}
-  select,button,a{padding:9px 12px; border-radius:10px; border:1px solid var(--edge); font-size:14px; background:#0d1a30; color:var(--text); text-decoration:none}
-  button{background:var(--brand); border:1px solid transparent}
-  button:hover{filter:brightness(1.08)}
-  a:hover{filter:brightness(1.12)}
-  .grid{display:grid; grid-template-columns:1.1fr 1.9fr; gap:16px}
+  body{margin:0;font-family:Inter,system-ui,-apple-system,Segoe UI,Roboto,Arial;color:var(--text);background:linear-gradient(180deg,var(--bg),var(--bg2));}
+  .wrap{max-width:1180px;margin:28px auto;padding:0 18px}
+  header{display:flex;justify-content:space-between;align-items:center;background:linear-gradient(90deg,var(--brand),#0ea5e9);
+         color:#fff;border-radius:16px;padding:16px 18px;box-shadow:0 12px 32px rgba(0,0,0,.25)}
+  h1{margin:0;font-size:20px;font-weight:800}
+  .ver{opacity:.85;font-size:12px;padding:2px 8px;border-radius:999px;background:rgba(255,255,255,.18)}
+  .toolbar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:16px 0}
+  .seg{display:flex;background:var(--card);border:1px solid var(--edge);border-radius:12px;overflow:hidden}
+  .seg button{appearance:none;border:0;background:transparent;padding:9px 14px;font-weight:600;color:var(--muted);cursor:pointer}
+  .seg button.active{color:var(--text);background:rgba(29,95,211,.12)}
+  .btn, a.btn{padding:9px 12px;border-radius:10px;border:1px solid var(--edge);background:var(--card);color:var(--text);text-decoration:none}
+  .grid{display:grid;grid-template-columns:1.2fr 1.8fr;gap:16px}
   @media (max-width:980px){ .grid{grid-template-columns:1fr} }
-  .card{background:var(--card); border:1px solid var(--edge); border-radius:14px; padding:16px; box-shadow:0 6px 20px rgba(0,0,0,.2)}
-  .kpis{display:grid; grid-template-columns:repeat(3,1fr); gap:12px}
-  .kpi{display:flex; flex-direction:column; gap:6px; background:#0c1527; border:1px solid var(--edge); border-radius:12px; padding:14px}
-  .kpi .label{color:var(--muted); font-size:12px}
-  .kpi .val{font-size:28px; font-weight:800; letter-spacing:.2px}
-  .muted{color:var(--muted)}
-  .chart-box{height:340px; position:relative}
-  .chart-box canvas{position:absolute; inset:0; width:100% !important; height:100% !important}
-  table{width:100%; border-collapse:collapse; table-layout:fixed}
-  th, td{padding:10px; border-bottom:1px solid var(--edge); text-align:left; font-size:14px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis}
-  th{position:sticky; top:0; background:#0e1a2d; z-index:1}
-  .table-wrap{max-height:420px; overflow:auto; border:1px solid var(--edge); border-radius:12px}
-  .cols-2{width:38%} .cols-1{width:62%}
-  .status{margin-left:auto; font-size:13px; color:var(--muted)}
+  .card{background:var(--card);border:1px solid var(--edge);border-radius:14px;padding:16px;box-shadow:0 8px 28px rgba(0,0,0,.16)}
+  .kpis{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}
+  .kpi{background:linear-gradient(180deg,rgba(29,95,211,.08),transparent);border:1px solid var(--edge);border-radius:12px;padding:16px}
+  .kpi .label{color:var(--muted);font-size:12px}
+  .kpi .val{font-size:28px;font-weight:800;letter-spacing:.2px;transition:transform .2s ease}
+  .chart-box{height:360px;position:relative}
+  .chart-box canvas{position:absolute;inset:0;width:100% !important;height:100% !important}
+  .table-wrap{max-height:440px;overflow:auto;border:1px solid var(--edge);border-radius:12px}
+  table{width:100%;border-collapse:collapse;table-layout:fixed}
+  th,td{padding:10px;border-bottom:1px solid var(--edge);text-align:left;font-size:14px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  th{position:sticky;top:0;background:var(--card);z-index:1}
+  .muted{color:var(--muted)} .status{margin-left:auto;font-size:13px;color:var(--muted)}
 </style>
 
 <div class="wrap">
-  <header class="banner">
-    <div class="title">
-      <h1>Statistiques d’usage</h1>
-      <span class="ver">v3.2</span>
-    </div>
+  <header>
+    <div><h1>Statistiques d’usage</h1><div class="ver">v4</div></div>
+    <a class="btn" href="/events.csv" target="_blank">Télécharger le CSV</a>
   </header>
 
   <div class="toolbar">
-    <span class="muted">Période :</span>
-    <select id="days">
-      <option value="7">7 jours</option>
-      <option value="30" selected>30 jours</option>
-      <option value="90">90 jours</option>
-    </select>
-    <button id="refresh">Actualiser</button>
-    <a href="/events.csv" target="_blank">Télécharger le CSV</a>
+    <div class="seg" role="tablist" aria-label="Période">
+      <button id="d7"  class="active" role="tab" aria-selected="true">7 jours</button>
+      <button id="d30" role="tab">30 jours</button>
+      <button id="d90" role="tab">90 jours</button>
+    </div>
     <span id="status" class="status"></span>
   </div>
 
   <div class="kpis">
-    <div class="kpi">
-      <div class="label">Événements (24h)</div>
-      <div id="kpiLast" class="val">–</div>
-    </div>
-    <div class="kpi">
-      <div class="label">Total sur période</div>
-      <div id="kpiTotal" class="val">–</div>
-    </div>
-    <div class="kpi">
-      <div class="label">Visiteurs (IP) uniques</div>
-      <div id="kpiIPs" class="val">–</div>
-    </div>
+    <div class="kpi"><div class="label">Événements (24h)</div><div id="kpiLast" class="val">–</div></div>
+    <div class="kpi"><div class="label">Total sur période</div><div id="kpiTotal" class="val">–</div></div>
+    <div class="kpi"><div class="label">Visiteurs (IP) uniques</div><div id="kpiIPs" class="val">–</div></div>
   </div>
 
   <div class="grid" style="margin-top:14px">
@@ -322,9 +291,7 @@ def stats_html():
       <div class="muted" style="margin-bottom:8px">Par type d’événement</div>
       <div class="table-wrap">
         <table>
-          <thead>
-            <tr><th class="cols-1">Événement</th><th class="cols-2">Compteur</th></tr>
-          </thead>
+          <thead><tr><th>Événement</th><th>Compteur</th></tr></thead>
           <tbody id="byEvent"></tbody>
         </table>
       </div>
@@ -336,68 +303,79 @@ def stats_html():
 <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 <script>
   const statusEl = document.getElementById('status');
-  const daysSel  = document.getElementById('days');
   const kLast = document.getElementById('kpiLast');
   const kTot  = document.getElementById('kpiTotal');
   const kIPs  = document.getElementById('kpiIPs');
   const byEventEl = document.getElementById('byEvent');
   const periodEl  = document.getElementById('period');
-  let chart;
+  let chart, currentDays = 7;
 
+  const btns = {7:document.getElementById('d7'), 30:document.getElementById('d30'), 90:document.getElementById('d90')};
+  Object.entries(btns).forEach(([d,el])=>{
+    el.addEventListener('click', ()=>{ setActive(+d); load(); });
+  });
+
+  function setActive(days){
+    currentDays = days;
+    Object.values(btns).forEach(b=>b.classList.remove('active'));
+    btns[days].classList.add('active');
+  }
   function nb(x){ return new Intl.NumberFormat('fr-FR').format(x||0); }
   function setStatus(t){ statusEl.textContent = t || ""; }
 
   async function load(){
     setStatus("Chargement…");
-    const days = daysSel.value;
     try{
-      const r = await fetch('/stats?days=' + days + '&_=' + Date.now(), { cache:'no-store' });
+      const r = await fetch('/stats?days=' + currentDays + '&_=' + Date.now(), { cache:'no-store' });
       const data = await r.json();
 
+      // KPIs
       kLast.textContent = nb(data.last);
       kTot.textContent  = nb(data.total);
       kIPs.textContent  = nb(data.unique_ips);
+      [kLast,kTot,kIPs].forEach(el=>{ el.style.transform='scale(1.06)'; setTimeout(()=>el.style.transform='',120); });
 
+      // Période lisible
       if ((data.by_day||[]).length){
         const a = data.by_day[0].day, b = data.by_day[data.by_day.length-1].day;
         periodEl.textContent = `Période affichée : ${a} → ${b}`;
-      } else {
-        periodEl.textContent = "Aucune donnée sur la période.";
-      }
+      } else { periodEl.textContent = "Aucune donnée sur la période."; }
 
+      // Chart
       const labels = (data.by_day||[]).map(x => x.day);
       const values = (data.by_day||[]).map(x => x.n);
       if (chart) chart.destroy();
       chart = new Chart(document.getElementById('chart'), {
         type: 'line',
-        data: { labels, datasets:[{ label:'Événements', data: values, tension:.25 }] },
+        data: { labels, datasets:[{ label:'Événements', data: values, tension:.25, fill:true }] },
         options: {
           responsive:true, maintainAspectRatio:false,
-          plugins:{ legend:{ display:false } },
+          plugins:{ legend:{ display:false }, tooltip:{ mode:'index', intersect:false } },
+          interaction:{ mode:'index', intersect:false },
           scales:{ y:{ beginAtZero:true, ticks:{ precision:0 } } }
         }
       });
 
-      byEventEl.innerHTML = (data.by_event||[]).map(x => `
-        <tr><td title="${x.event||''}">${x.event||''}</td><td>${nb(x.n)}</td></tr>
-      `).join('') || `<tr><td colspan="2" class="muted">Aucune donnée.</td></tr>`;
+      // Tableau by_event
+      byEventEl.innerHTML = (data.by_event||[]).map(x =>
+        `<tr><td title="${x.event||''}">${x.event||''}</td><td>${nb(x.n)}</td></tr>`
+      ).join('') || `<tr><td colspan="2" class="muted">Aucune donnée.</td></tr>`;
 
       setStatus("");
     }catch(e){
       console.error(e);
       setStatus("Erreur de chargement");
-      byEventEl.innerHTML = `<tr><td colspan="2" style="color:#fca5a5">Impossible de charger les données.</td></tr>`;
+      byEventEl.innerHTML = `<tr><td colspan="2" style="color:#f43f5e">Impossible de charger les données.</td></tr>`;
     }
   }
 
-  daysSel.addEventListener('change', load);
-  document.getElementById('refresh').onclick = load;
+  setActive(7);
   load();
 </script>
 """
     return HTMLResponse(textwrap.dedent(html), headers={"Cache-Control": "no-store"})
 
-# -------------- Startup --------------
+# -------------------- Startup --------------------
 @app.on_event("startup")
 def on_startup():
     _get_pool()

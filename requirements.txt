@@ -1,3 +1,4 @@
+pip>=25.2
 fastapi
 uvicorn[standard]
 pydantic>=2
