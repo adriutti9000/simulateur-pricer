@@ -44,7 +44,11 @@ def _build_pool() -> Optional[ConnectionPool]:
         conninfo=conninfo,
         min_size=1,
         max_size=3,
-        kwargs={"autocommit": True, "prepare_threshold": 0},
+        kwargs={
+            "autocommit": True,
+            "prepare_threshold": 0,
+            "row_factory": dict_row,  # ✅ fetch* -> dicts
+        },
     )
 
 def _ensure_schema(conn: psycopg.Connection) -> None:
@@ -169,15 +173,18 @@ def events_csv():
 
 @app.get("/stats")
 def stats(days: int = 30):
+    # borne (sécurité)
     days = max(1, min(days, 365))
     out = {"days": days, "by_day": [], "last": 0, "by_event": [], "total": 0, "unique_ips": 0}
 
     def _query(conn: psycopg.Connection):
+        # ⚠️ IMPORTANT : passer par %s::interval (et non "INTERVAL %s")
+        # pour éviter l'erreur "syntax error at or near $1"
         by_day = conn.execute(
             """
             SELECT to_char(date_trunc('day', ts_utc), 'YYYY-MM-DD') AS day, COUNT(*) AS n
             FROM events
-            WHERE ts_utc >= NOW() AT TIME ZONE 'UTC' - INTERVAL %s
+            WHERE ts_utc >= (NOW() AT TIME ZONE 'UTC') - %s::interval
             GROUP BY 1 ORDER BY 1
             """,
             (f"{days} days",),
@@ -187,25 +194,25 @@ def stats(days: int = 30):
             """
             SELECT event, COUNT(*) AS n
             FROM events
-            WHERE ts_utc >= NOW() AT TIME ZONE 'UTC' - INTERVAL %s
+            WHERE ts_utc >= (NOW() AT TIME ZONE 'UTC') - %s::interval
             GROUP BY 1 ORDER BY 2 DESC, 1 ASC
             """,
             (f"{days} days",),
         ).fetchall()
 
         last24 = conn.execute(
-            "SELECT COUNT(*) FROM events WHERE ts_utc >= NOW() AT TIME ZONE 'UTC' - INTERVAL '24 hours'"
-        ).fetchone()[0]
+            "SELECT COUNT(*) AS cnt FROM events WHERE ts_utc >= (NOW() AT TIME ZONE 'UTC') - INTERVAL '24 hours'"
+        ).fetchone()["cnt"]
 
         total = conn.execute(
-            "SELECT COUNT(*) FROM events WHERE ts_utc >= NOW() AT TIME ZONE 'UTC' - INTERVAL %s",
+            "SELECT COUNT(*) AS cnt FROM events WHERE ts_utc >= (NOW() AT TIME ZONE 'UTC') - %s::interval",
             (f"{days} days",),
-        ).fetchone()[0]
+        ).fetchone()["cnt"]
 
         unique_ips = conn.execute(
-            "SELECT COUNT(DISTINCT ip) FROM events WHERE ts_utc >= NOW() AT TIME ZONE 'UTC' - INTERVAL %s",
+            "SELECT COUNT(DISTINCT ip) AS cnt FROM events WHERE ts_utc >= (NOW() AT TIME ZONE 'UTC') - %s::interval",
             (f"{days} days",),
-        ).fetchone()[0]
+        ).fetchone()["cnt"]
 
         return by_day, by_event, last24, total, unique_ips
 
