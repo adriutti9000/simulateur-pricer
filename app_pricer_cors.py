@@ -178,8 +178,8 @@ def stats(days: int = 30):
       - labels: ["YYYY-MM-DD", ...] (tous les jours, zéros inclus)
       - visits_by_day: nb de pageview/jour
       - sims_by_day:   nb de calculate_click/jour
-      - by_event:   top événements bruts (comme avant)
-      - last:       nb d'événements sur 24h (tous types, inchangé)
+      - by_event:      top événements (conservé si tu en as besoin ailleurs)
+      - last:          nb d'événements sur 24h (tous types, inchangé)
       - visits_total, unique_ips, visits_per_user, attempts_total, attempts_success
     """
     days = max(1, min(days, 365))
@@ -199,7 +199,6 @@ def stats(days: int = 30):
 
     def _query(conn: psycopg.Connection):
         # Série complète de dates (inclure les jours sans donnée)
-        # borne basse = jour 0h UTC il y a "days-1" jours
         series_sql = """
         WITH bounds AS (
           SELECT
@@ -287,7 +286,7 @@ def stats(days: int = 30):
 
     return JSONResponse(out)
 
-# -------------------- Nouveau dashboard /stats.html --------------------
+# -------------------- Dashboard /stats.html --------------------
 @app.get("/stats.html", include_in_schema=False)
 def stats_html():
     html = """
@@ -314,20 +313,19 @@ def stats_html():
   .seg button{appearance:none;border:0;background:transparent;padding:9px 14px;font-weight:600;color:var(--muted);cursor:pointer}
   .seg button.active{color:var(--text);background:rgba(29,95,211,.12)}
   .btn, a.btn{padding:9px 12px;border-radius:10px;border:1px solid var(--edge);background:var(--card);color:var(--text);text-decoration:none}
-  .grid{display:grid;grid-template-columns:1.2fr 1.8fr;gap:16px}
-  @media (max-width:980px){ .grid{grid-template-columns:1fr} }
-  .card{background:var(--card);border:1px solid var(--edge);border-radius:14px;padding:16px;box-shadow:0 8px 28px rgba(0,0,0,.16)}
-  .kpis{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}
+
+  /* KPIs: 3 colonnes (on supprime "visites / utilisateur unique") */
+  .kpis{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}
   .kpi{background:linear-gradient(180deg,rgba(29,95,211,.08),transparent);border:1px solid var(--edge);border-radius:12px;padding:16px}
   .kpi .label{color:var(--muted);font-size:12px}
   .kpi .val{font-size:28px;font-weight:800;letter-spacing:.2px;transition:transform .2s ease}
-  .chart-box{height:360px;position:relative}
+
+  /* Carte unique pour le graphique, plus haute */
+  .card{background:var(--card);border:1px solid var(--edge);border-radius:14px;padding:16px;box-shadow:0 8px 28px rgba(0,0,0,.16);margin-top:14px}
+  .chart-box{height:460px;position:relative}
   .chart-box canvas{position:absolute;inset:0;width:100% !important;height:100% !important}
-  .table-wrap{max-height:440px;overflow:auto;border:1px solid var(--edge);border-radius:12px}
-  table{width:100%;border-collapse:collapse;table-layout:fixed}
-  th,td{padding:10px;border-bottom:1px solid var(--edge);text-align:left;font-size:14px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-  th{position:sticky;top:0;background:var(--card);z-index:1}
-  .muted{color:var(--muted)} .status{margin-left:auto;font-size:13px;color:var(--muted)}
+  .period{margin-top:8px;color:var(--muted);font-size:14px}
+  .status{margin-left:auto;font-size:13px;color:var(--muted)}
 </style>
 
 <div class="wrap">
@@ -347,26 +345,13 @@ def stats_html():
 
   <div class="kpis">
     <div class="kpi"><div class="label">Visites totales</div><div id="k_visits" class="val">–</div></div>
-    <div class="kpi"><div class="label">Visites / utilisateur unique</div><div id="k_vpu" class="val">–</div></div>
     <div class="kpi"><div class="label">Tentatives totales</div><div id="k_attempts" class="val">–</div></div>
     <div class="kpi"><div class="label">Tentatives réussies</div><div id="k_success" class="val">–</div></div>
   </div>
 
-  <div class="grid" style="margin-top:14px">
-    <div class="card">
-      <div class="muted" style="margin-bottom:8px">Courbes : visites vs. simulations</div>
-      <div class="chart-box"><canvas id="chart"></canvas></div>
-    </div>
-    <div class="card">
-      <div class="muted" style="margin-bottom:8px">Par type d’événement</div>
-      <div class="table-wrap">
-        <table>
-          <thead><tr><th>Événement</th><th>Compteur</th></tr></thead>
-          <tbody id="byEvent"></tbody>
-        </table>
-      </div>
-      <div id="period" class="muted" style="margin-top:10px"></div>
-    </div>
+  <div class="card">
+    <div class="chart-box"><canvas id="chart"></canvas></div>
+    <div id="period" class="period"></div>
   </div>
 </div>
 
@@ -374,10 +359,8 @@ def stats_html():
 <script>
   const statusEl = document.getElementById('status');
   const kVisits = document.getElementById('k_visits');
-  const kVPU    = document.getElementById('k_vpu');
   const kAtt    = document.getElementById('k_attempts');
   const kSucc   = document.getElementById('k_success');
-  const byEventEl = document.getElementById('byEvent');
   const periodEl  = document.getElementById('period');
   let chart, currentDays = 7;
 
@@ -392,8 +375,19 @@ def stats_html():
     btns[days].classList.add('active');
   }
   function nb(x){ return new Intl.NumberFormat('fr-FR').format(x||0); }
-  function nb2(x){ return new Intl.NumberFormat('fr-FR', { maximumFractionDigits: 2 }).format(x||0); }
   function setStatus(t){ statusEl.textContent = t || ""; }
+
+  function makeGradients(ctx){
+    const gVisits = ctx.createLinearGradient(0,0,0,ctx.canvas.height);
+    gVisits.addColorStop(0,'rgba(96,165,250,.9)');   // bleu
+    gVisits.addColorStop(1,'rgba(96,165,250,.08)');
+
+    const gSims = ctx.createLinearGradient(0,0,0,ctx.canvas.height);
+    gSims.addColorStop(0,'rgba(248,113,113,.9)');   // rose
+    gSims.addColorStop(1,'rgba(248,113,113,.08)');
+
+    return { gVisits, gSims };
+  }
 
   async function load(){
     setStatus("Chargement…");
@@ -403,10 +397,9 @@ def stats_html():
 
       // KPIs
       kVisits.textContent = nb(data.visits_total);
-      kVPU.textContent    = data.unique_ips ? nb2(data.visits_per_user) : "–";
       kAtt.textContent    = nb(data.attempts_total);
       kSucc.textContent   = nb(data.attempts_success);
-      [kVisits,kVPU,kAtt,kSucc].forEach(el=>{ el.style.transform='scale(1.06)'; setTimeout(()=>el.style.transform='',120); });
+      [kVisits,kAtt,kSucc].forEach(el=>{ el.style.transform='scale(1.06)'; setTimeout(()=>el.style.transform='',120); });
 
       // Période lisible
       if ((data.labels||[]).length){
@@ -414,38 +407,59 @@ def stats_html():
         periodEl.textContent = `Période affichée : ${a} → ${b}`;
       } else { periodEl.textContent = "Aucune donnée sur la période."; }
 
-      // Chart (2 courbes + légende)
+      // Chart (2 courbes, nouveau design)
       const labels = data.labels || [];
       const visits = data.visits_by_day || [];
       const sims   = data.sims_by_day || [];
+
+      const ctx = document.getElementById('chart').getContext('2d');
+      const { gVisits, gSims } = makeGradients(ctx);
+
       if (chart) chart.destroy();
-      chart = new Chart(document.getElementById('chart'), {
+      chart = new Chart(ctx, {
         type: 'line',
         data: {
           labels,
           datasets:[
-            { label:'Visites', data: visits, tension:.25, fill:false },
-            { label:'Simulations', data: sims, tension:.25, fill:false }
+            {
+              label:'Visites',
+              data: visits,
+              tension:.3,
+              borderWidth:2,
+              borderColor:'rgba(96,165,250,1)',
+              backgroundColor:gVisits,
+              pointRadius:3,
+              pointHoverRadius:5,
+              fill:true
+            },
+            {
+              label:'Simulations',
+              data: sims,
+              tension:.3,
+              borderWidth:2,
+              borderColor:'rgba(248,113,113,1)',
+              backgroundColor:gSims,
+              pointRadius:3,
+              pointHoverRadius:5,
+              fill:true
+            }
           ]
         },
         options: {
           responsive:true, maintainAspectRatio:false,
           plugins:{ legend:{ display:true, position:'top' }, tooltip:{ mode:'index', intersect:false } },
           interaction:{ mode:'index', intersect:false },
-          scales:{ y:{ beginAtZero:true, ticks:{ precision:0 } } }
+          scales:{
+            y:{ beginAtZero:true, ticks:{ precision:0 } },
+            x:{ ticks:{ maxRotation:0, autoSkip:true, maxTicksLimit:10 } }
+          }
         }
       });
-
-      // Tableau by_event (inchangé)
-      byEventEl.innerHTML = (data.by_event||[]).map(x =>
-        `<tr><td title="${x.event||''}">${x.event||''}</td><td>${nb(x.n)}</td></tr>`
-      ).join('') || `<tr><td colspan="2" class="muted">Aucune donnée.</td></tr>`;
 
       setStatus("");
     }catch(e){
       console.error(e);
       setStatus("Erreur de chargement");
-      byEventEl.innerHTML = `<tr><td colspan="2" style="color:#f43f5e">Impossible de charger les données.</td></tr>`;
     }
   }
 
