@@ -10,7 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, HTMLResponse, PlainTextResponse
 from pydantic import BaseModel
 
-from pricer_engine import compute_annuity
+from pricer_engine import compute_annuity  # ⚠️ formules inchangées
 
 import psycopg
 from psycopg.rows import dict_row
@@ -21,7 +21,7 @@ from psycopg.errors import OperationalError, InterfaceError
 app = FastAPI(title="Simulateur Pricer API")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # restreins à ton domaine Netlify si tu veux
+    allow_origins=["*"],  # (optionnel) restreins à ton domaine Netlify
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -47,7 +47,7 @@ def _build_pool() -> Optional[ConnectionPool]:
         kwargs={
             "autocommit": True,
             "prepare_threshold": 0,
-            "row_factory": dict_row,  # ✅ fetch* -> dicts
+            "row_factory": dict_row,  # fetch* -> dicts
         },
     )
 
@@ -173,22 +173,67 @@ def events_csv():
 
 @app.get("/stats")
 def stats(days: int = 30):
-    # borne (sécurité)
+    """
+    Renvoie:
+      - labels: ["YYYY-MM-DD", ...] (tous les jours, zéros inclus)
+      - visits_by_day: nb de pageview/jour
+      - sims_by_day:   nb de calculate_click/jour
+      - by_event:   top événements bruts (comme avant)
+      - last:       nb d'événements sur 24h (tous types, inchangé)
+      - visits_total, unique_ips, visits_per_user, attempts_total, attempts_success
+    """
     days = max(1, min(days, 365))
-    out = {"days": days, "by_day": [], "last": 0, "by_event": [], "total": 0, "unique_ips": 0}
+    out = {
+        "days": days,
+        "labels": [],
+        "visits_by_day": [],
+        "sims_by_day": [],
+        "by_event": [],
+        "last": 0,
+        "visits_total": 0,
+        "unique_ips": 0,
+        "visits_per_user": 0.0,
+        "attempts_total": 0,
+        "attempts_success": 0,
+    }
 
     def _query(conn: psycopg.Connection):
-        # ⚠️ IMPORTANT : passer par %s::interval (et non "INTERVAL %s")
-        # pour éviter l'erreur "syntax error at or near $1"
-        by_day = conn.execute(
-            """
-            SELECT to_char(date_trunc('day', ts_utc), 'YYYY-MM-DD') AS day, COUNT(*) AS n
-            FROM events
-            WHERE ts_utc >= (NOW() AT TIME ZONE 'UTC') - %s::interval
-            GROUP BY 1 ORDER BY 1
-            """,
-            (f"{days} days",),
-        ).fetchall()
+        # Série complète de dates (inclure les jours sans donnée)
+        # borne basse = jour 0h UTC il y a "days-1" jours
+        series_sql = """
+        WITH bounds AS (
+          SELECT
+            date_trunc('day', (NOW() AT TIME ZONE 'UTC'))::timestamp AS today_utc,
+            date_trunc('day', (NOW() AT TIME ZONE 'UTC') - %s::interval)::timestamp AS start_utc
+        ),
+        series AS (
+          SELECT generate_series(b.start_utc, b.today_utc, '1 day'::interval) AS d
+          FROM bounds b
+        ),
+        visits AS (
+          SELECT date_trunc('day', ts_utc)::timestamp AS d, COUNT(*) AS n
+          FROM events
+          WHERE ts_utc >= (NOW() AT TIME ZONE 'UTC') - %s::interval
+            AND event = 'pageview'
+          GROUP BY 1
+        ),
+        sims AS (
+          SELECT date_trunc('day', ts_utc)::timestamp AS d, COUNT(*) AS n
+          FROM events
+          WHERE ts_utc >= (NOW() AT TIME ZONE 'UTC') - %s::interval
+            AND event = 'calculate_click'
+          GROUP BY 1
+        )
+        SELECT
+          to_char(s.d, 'YYYY-MM-DD') AS day,
+          COALESCE(v.n, 0) AS visits,
+          COALESCE(c.n, 0) AS sims
+        FROM series s
+        LEFT JOIN visits v ON v.d = s.d
+        LEFT JOIN sims   c ON c.d = s.d
+        ORDER BY s.d
+        """
+        by_day = conn.execute(series_sql, (f"{days} days", f"{days} days", f"{days} days")).fetchall()
 
         by_event = conn.execute(
             """
@@ -204,8 +249,18 @@ def stats(days: int = 30):
             "SELECT COUNT(*) AS cnt FROM events WHERE ts_utc >= (NOW() AT TIME ZONE 'UTC') - INTERVAL '24 hours'"
         ).fetchone()["cnt"]
 
-        total = conn.execute(
-            "SELECT COUNT(*) AS cnt FROM events WHERE ts_utc >= (NOW() AT TIME ZONE 'UTC') - %s::interval",
+        visits_total = conn.execute(
+            "SELECT COUNT(*) AS cnt FROM events WHERE ts_utc >= (NOW() AT TIME ZONE 'UTC') - %s::interval AND event='pageview'",
+            (f"{days} days",),
+        ).fetchone()["cnt"]
+
+        attempts_total = conn.execute(
+            "SELECT COUNT(*) AS cnt FROM events WHERE ts_utc >= (NOW() AT TIME ZONE 'UTC') - %s::interval AND event='calculate_click'",
+            (f"{days} days",),
+        ).fetchone()["cnt"]
+
+        attempts_success = conn.execute(
+            "SELECT COUNT(*) AS cnt FROM events WHERE ts_utc >= (NOW() AT TIME ZONE 'UTC') - %s::interval AND event='calculate_success'",
             (f"{days} days",),
         ).fetchone()["cnt"]
 
@@ -214,14 +269,22 @@ def stats(days: int = 30):
             (f"{days} days",),
         ).fetchone()["cnt"]
 
-        return by_day, by_event, last24, total, unique_ips
+        return by_day, by_event, last24, visits_total, attempts_total, attempts_success, unique_ips
 
-    rows_day, rows_event, last24, total, uips = _with_db(_query) or ([], [], 0, 0, 0)
-    out["by_day"] = [{"day": r["day"], "n": int(r["n"])} for r in rows_day]
+    res = _with_db(_query) or ([], [], 0, 0, 0, 0, 0)
+    rows_day, rows_event, last24, visits_total, attempts_total, attempts_success, uips = res
+
+    out["labels"] = [r["day"] for r in rows_day]
+    out["visits_by_day"] = [int(r["visits"]) for r in rows_day]
+    out["sims_by_day"]   = [int(r["sims"]) for r in rows_day]
     out["by_event"] = [{"event": r["event"], "n": int(r["n"])} for r in rows_event]
     out["last"] = int(last24 or 0)
-    out["total"] = int(total or 0)
+    out["visits_total"] = int(visits_total or 0)
+    out["attempts_total"] = int(attempts_total or 0)
+    out["attempts_success"] = int(attempts_success or 0)
     out["unique_ips"] = int(uips or 0)
+    out["visits_per_user"] = (out["visits_total"] / out["unique_ips"]) if out["unique_ips"] else 0.0
+
     return JSONResponse(out)
 
 # -------------------- Nouveau dashboard /stats.html --------------------
@@ -229,7 +292,7 @@ def stats(days: int = 30):
 def stats_html():
     html = """
 <!doctype html><html lang="fr"><meta charset="utf-8">
-<title>Statistiques d’usage — simulateur</title>
+<title>Spirit AM - Tracker de la rente obligataire</title>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta http-equiv="Cache-Control" content="no-store" />
 <style>
@@ -246,7 +309,6 @@ def stats_html():
   header{display:flex;justify-content:space-between;align-items:center;background:linear-gradient(90deg,var(--brand),#0ea5e9);
          color:#fff;border-radius:16px;padding:16px 18px;box-shadow:0 12px 32px rgba(0,0,0,.25)}
   h1{margin:0;font-size:20px;font-weight:800}
-  .ver{opacity:.85;font-size:12px;padding:2px 8px;border-radius:999px;background:rgba(255,255,255,.18)}
   .toolbar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:16px 0}
   .seg{display:flex;background:var(--card);border:1px solid var(--edge);border-radius:12px;overflow:hidden}
   .seg button{appearance:none;border:0;background:transparent;padding:9px 14px;font-weight:600;color:var(--muted);cursor:pointer}
@@ -255,7 +317,7 @@ def stats_html():
   .grid{display:grid;grid-template-columns:1.2fr 1.8fr;gap:16px}
   @media (max-width:980px){ .grid{grid-template-columns:1fr} }
   .card{background:var(--card);border:1px solid var(--edge);border-radius:14px;padding:16px;box-shadow:0 8px 28px rgba(0,0,0,.16)}
-  .kpis{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}
+  .kpis{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}
   .kpi{background:linear-gradient(180deg,rgba(29,95,211,.08),transparent);border:1px solid var(--edge);border-radius:12px;padding:16px}
   .kpi .label{color:var(--muted);font-size:12px}
   .kpi .val{font-size:28px;font-weight:800;letter-spacing:.2px;transition:transform .2s ease}
@@ -270,7 +332,7 @@ def stats_html():
 
 <div class="wrap">
   <header>
-    <div><h1>Statistiques d’usage</h1><div class="ver">v4</div></div>
+    <div><h1>Spirit AM - Tracker de la rente obligataire</h1></div>
     <a class="btn" href="/events.csv" target="_blank">Télécharger le CSV</a>
   </header>
 
@@ -284,14 +346,15 @@ def stats_html():
   </div>
 
   <div class="kpis">
-    <div class="kpi"><div class="label">Événements (24h)</div><div id="kpiLast" class="val">–</div></div>
-    <div class="kpi"><div class="label">Total sur période</div><div id="kpiTotal" class="val">–</div></div>
-    <div class="kpi"><div class="label">Visiteurs (IP) uniques</div><div id="kpiIPs" class="val">–</div></div>
+    <div class="kpi"><div class="label">Visites totales</div><div id="k_visits" class="val">–</div></div>
+    <div class="kpi"><div class="label">Visites / utilisateur unique</div><div id="k_vpu" class="val">–</div></div>
+    <div class="kpi"><div class="label">Tentatives totales</div><div id="k_attempts" class="val">–</div></div>
+    <div class="kpi"><div class="label">Tentatives réussies</div><div id="k_success" class="val">–</div></div>
   </div>
 
   <div class="grid" style="margin-top:14px">
     <div class="card">
-      <div class="muted" style="margin-bottom:8px">Événements par jour</div>
+      <div class="muted" style="margin-bottom:8px">Courbes : visites vs. simulations</div>
       <div class="chart-box"><canvas id="chart"></canvas></div>
     </div>
     <div class="card">
@@ -310,9 +373,10 @@ def stats_html():
 <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 <script>
   const statusEl = document.getElementById('status');
-  const kLast = document.getElementById('kpiLast');
-  const kTot  = document.getElementById('kpiTotal');
-  const kIPs  = document.getElementById('kpiIPs');
+  const kVisits = document.getElementById('k_visits');
+  const kVPU    = document.getElementById('k_vpu');
+  const kAtt    = document.getElementById('k_attempts');
+  const kSucc   = document.getElementById('k_success');
   const byEventEl = document.getElementById('byEvent');
   const periodEl  = document.getElementById('period');
   let chart, currentDays = 7;
@@ -328,6 +392,7 @@ def stats_html():
     btns[days].classList.add('active');
   }
   function nb(x){ return new Intl.NumberFormat('fr-FR').format(x||0); }
+  function nb2(x){ return new Intl.NumberFormat('fr-FR', { maximumFractionDigits: 2 }).format(x||0); }
   function setStatus(t){ statusEl.textContent = t || ""; }
 
   async function load(){
@@ -337,33 +402,41 @@ def stats_html():
       const data = await r.json();
 
       // KPIs
-      kLast.textContent = nb(data.last);
-      kTot.textContent  = nb(data.total);
-      kIPs.textContent  = nb(data.unique_ips);
-      [kLast,kTot,kIPs].forEach(el=>{ el.style.transform='scale(1.06)'; setTimeout(()=>el.style.transform='',120); });
+      kVisits.textContent = nb(data.visits_total);
+      kVPU.textContent    = data.unique_ips ? nb2(data.visits_per_user) : "–";
+      kAtt.textContent    = nb(data.attempts_total);
+      kSucc.textContent   = nb(data.attempts_success);
+      [kVisits,kVPU,kAtt,kSucc].forEach(el=>{ el.style.transform='scale(1.06)'; setTimeout(()=>el.style.transform='',120); });
 
       // Période lisible
-      if ((data.by_day||[]).length){
-        const a = data.by_day[0].day, b = data.by_day[data.by_day.length-1].day;
+      if ((data.labels||[]).length){
+        const a = data.labels[0], b = data.labels[data.labels.length-1];
         periodEl.textContent = `Période affichée : ${a} → ${b}`;
       } else { periodEl.textContent = "Aucune donnée sur la période."; }
 
-      // Chart
-      const labels = (data.by_day||[]).map(x => x.day);
-      const values = (data.by_day||[]).map(x => x.n);
+      // Chart (2 courbes + légende)
+      const labels = data.labels || [];
+      const visits = data.visits_by_day || [];
+      const sims   = data.sims_by_day || [];
       if (chart) chart.destroy();
       chart = new Chart(document.getElementById('chart'), {
         type: 'line',
-        data: { labels, datasets:[{ label:'Événements', data: values, tension:.25, fill:true }] },
+        data: {
+          labels,
+          datasets:[
+            { label:'Visites', data: visits, tension:.25, fill:false },
+            { label:'Simulations', data: sims, tension:.25, fill:false }
+          ]
+        },
         options: {
           responsive:true, maintainAspectRatio:false,
-          plugins:{ legend:{ display:false }, tooltip:{ mode:'index', intersect:false } },
+          plugins:{ legend:{ display:true, position:'top' }, tooltip:{ mode:'index', intersect:false } },
           interaction:{ mode:'index', intersect:false },
           scales:{ y:{ beginAtZero:true, ticks:{ precision:0 } } }
         }
       });
 
-      // Tableau by_event
+      // Tableau by_event (inchangé)
       byEventEl.innerHTML = (data.by_event||[]).map(x =>
         `<tr><td title="${x.event||''}">${x.event||''}</td><td>${nb(x.n)}</td></tr>`
       ).join('') || `<tr><td colspan="2" class="muted">Aucune donnée.</td></tr>`;
