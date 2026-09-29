@@ -84,7 +84,7 @@ def compute_annuity(
     # TOTAL = gestion (affichée) + garde + contrat
     total_frais = gestion_display + garde_rate + contract_rate
 
-    rente_nette = amount * curve_rate * (1.0 - total_frais)
+    rente_nette = amount * (curve_rate - total_frais)
     rente_arrondie = int(round(rente_nette))  # sans décimales
 
     return {
