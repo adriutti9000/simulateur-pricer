@@ -1,5 +1,6 @@
 # pricer_engine.py
 from typing import Dict
+import math
 
 # Courbes de taux (inchangées)
 _TENORS = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
@@ -58,9 +59,14 @@ def compute_annuity(
 ) -> Dict[str, float]:
     """
     Retourne un dict avec :
-      - rente_annuelle_arrondie (entier, sans décimales)
-      - gestion_rate (valeur affichée), retro_rate (info), garde_rate, frais_contrat, total_frais
-    Rente nette = montant * taux_courbe * (1 - total_frais)
+      - rente_annuelle_arrondie (arrondie au millier supérieur, comme l'Excel)
+      - gestion_rate, retro_rate, garde_rate, frais_contrat, total_frais
+
+    Logique reprise de l'Excel PRICER :
+      1) reconstitution du capital initial à l'échéance avec le taux net de frais ;
+      2) calcul du capital disponible pour la rente ;
+      3) capitalisation de cette poche avec un taux moyen de la courbe ;
+      4) division par la durée pour obtenir la rente annuelle.
     """
     if currency not in _CURVE:
         raise ValueError(f"Devise non supportée : {currency}")
@@ -70,22 +76,47 @@ def compute_annuity(
     curve_rate = _CURVE[currency][years] / 100.0  # décimal
 
     if include_retro:
-        # Gestion affichée = barème gestion (avec rétro) + rétro (affichée séparément)
-        gestion_base = _gestion_with_retro_base(amount)  # ex: 0,0035
-        retro_rate = _retro_rate(amount)                 # ex: 0,0015
-        gestion_display = gestion_base + retro_rate      # ex: 0,0035 + 0,0015 = 0,0050 (0,50 %)
+        # Gestion et rétrocession restent séparées, comme dans l'Excel
+        gestion_display = _gestion_with_retro_base(amount)
+        retro_rate = _retro_rate(amount)
     else:
-        gestion_display = _gestion_without_retro(amount) # ex: 0,0040 / 0,0050 / 0,0060
+        gestion_display = _gestion_without_retro(amount)
         retro_rate = 0.0
 
     garde_rate = _GARDE
     contract_rate = max(0.0, float(extra_contract_fee or 0.0))
 
-    # TOTAL = gestion (affichée) + garde + contrat
-    total_frais = gestion_display + garde_rate + contract_rate
+    # TOTAL = gestion + rétro + garde + contrat
+    total_frais = gestion_display + retro_rate + garde_rate + contract_rate
 
-    rente_nette = amount * (curve_rate - total_frais)
-    rente_arrondie = int(round(rente_nette))  # sans décimales
+    # 1) Taux net utilisé pour reconstituer le capital initial
+    net_reconstitution_rate = curve_rate - total_frais
+
+    # 2) Facteur de croissance sur la durée
+    taux_recapitalisation = (1.0 + net_reconstitution_rate) ** years
+
+    # 3) Capital à réserver aujourd'hui pour retrouver le montant initial à l'échéance
+    portefeuille_recapitalisation = amount / taux_recapitalisation
+
+    # 4) Capital disponible pour financer la rente
+    disponible_rente = amount - portefeuille_recapitalisation
+
+    # 5) Taux moyen de la poche rente
+    # Excel : moyenne des points de courbe de 1 an à la durée
+    #         * (durée + 1) / (durée * 2)
+    points_courbe = [_CURVE[currency][tenor] for tenor in range(1, years + 1)]
+    moyenne_courbe_pct = sum(points_courbe) / len(points_courbe)
+    taux_moyen_pct = moyenne_courbe_pct * (years + 1) / (years * 2)
+    taux_moyen = taux_moyen_pct / 100.0
+
+    # 6) Capitalisation de la poche destinée à la rente
+    rente_capitalisee = disponible_rente * (1.0 + taux_moyen) ** years
+
+    # 7) Rente annuelle
+    rente_annuelle = rente_capitalisee / years
+
+    # 8) Même arrondi que l'Excel : ROUNDUP(..., -3)
+    rente_arrondie = int(math.ceil(rente_annuelle / 1000.0) * 1000)
 
     return {
         "rente_annuelle_arrondie": rente_arrondie,
@@ -95,3 +126,4 @@ def compute_annuity(
         "frais_contrat": round(contract_rate, 6),
         "total_frais": round(total_frais, 6),
     }
+
